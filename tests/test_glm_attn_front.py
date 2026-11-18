@@ -114,5 +114,5 @@ def test_kernel_in_the_simulator_is_its_emulation(grid, T, full, lo, monkeypatch
 def test_a_wrong_placement_is_caught(monkeypatch):
     """The positive control: the shard placed at column 0 instead of 224 puts its columns in q's part, not c's."""
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
-    (qn, qp, kv, ki, qr), (wqn, wqp, wkv, wki, wqr) = run_sim(1, 3, True, lo=224, place_lo=0)
-    assert not close(kv, wkv)
+    got, want = run_sim(1, 3, True, lo=224, place_lo=0)
+    assert not close(got[2], want[2])  # the cache row
