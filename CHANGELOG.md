@@ -5,6 +5,22 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 
 ## [Unreleased]
 
+### Added
+
+- GLM-5.3 (`zai-org/GLM-5.3`, `GlmMoeDsaForCausalLM`): MLA with interleaved RoPE, a token-level DSA indexer whose selection
+  the "shared" layers reuse, a plain residual and the shared-expert MoE, on the existing paged cache, scheduler, sampler
+  and tensor parallelism (`trnrt/models/glm_moe_dsa.py`). It matches transformers 5.17.0 on CPU and serves on one
+  trn2.48xlarge as one engine of 64 ranks; its numbers and limits are in
+  [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md#glm-53-early-not-yet-tuned).
+- Expert parallelism of the routed experts, `--moe-ep` (GLM-5.3): groups of tp / ep ranks, each holding E / ep experts, so
+  the NKI MoE kernels take GLM-5.3 at 64 ranks. `trnrt compile decisions --moe-ep` writes its decisions.
+- `kernels/gemv_tiled.py`: a decode step's projections over weights pre-tiled at load (GLM-5.3's decode).
+- The engine serves models without recurrent state: a prefix hit resumes from any cached page, with no state
+  checkpoints, and the host-memory tier holds KV pages only.
+- `TRNRT_TEST_DEVICE=1`: the kernel tests' simulator calls run on a NeuronCore ([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#tests)).
+- Neuron SDKs after 2.32: NKI kernels compile through libtorch-neuronx-lite's native backend, and the compile cache's key
+  follows its compiler-argument functions.
+
 ## [0.1.0] - 2026-11-08
 
 The first public release.

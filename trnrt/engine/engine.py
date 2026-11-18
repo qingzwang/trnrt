@@ -108,7 +108,7 @@ def set_decode_routes(cfg: EngineConfig) -> None:
     build_shard calls it before building its shard (an engine's ranks and a capture's alike: each rank is its own process,
     given the EngineConfig), so they all trace the same routes; it sets every one, so an engine never inherits another's."""
     from ..kernels import dense_half, dsa_satwf, sp_gather
-    from ..models import decoder, hybrid, mla
+    from ..models import decoder, glm_moe_dsa, hybrid, mla
 
     hybrid.KDA_SHELL_MAXB = int(cfg.kda_shell_max_rows)
     hybrid.MOE_HALF_BELOW = int(cfg.ffn_half_below)
@@ -120,6 +120,7 @@ def set_decode_routes(cfg: EngineConfig) -> None:
     dense_half.SKIP_T = frozenset(cfg.dense_half_skip_rows)
     decoder.MTP_CHUNK_Q = int(cfg.mtp_chunk_q)
     decoder.DYN_MTP_KV = "1" if cfg.dyn_mtp_kv else "0"
+    glm_moe_dsa.MOE_EP = int(cfg.moe_ep)
 
 
 def local_k_counts(model) -> list[float] | None:
@@ -228,6 +229,14 @@ class LLMEngine:
         self.mcfg = ModelConfig.from_pretrained(path)
         if cfg.num_layers is not None:
             self.mcfg = self.mcfg.truncated(cfg.num_layers)
+        from ..models import glm_moe_dsa
+
+        if cfg.moe_ep != 1 and self.mcfg.architecture not in glm_moe_dsa.ARCHITECTURES:
+            raise ValueError(
+                f"moe_ep={cfg.moe_ep}: expert parallelism is implemented for GLM-5.3 only, not {self.mcfg.architecture}"
+            )
+        if cfg.moe_ep < 1 or cfg.tp % cfg.moe_ep:
+            raise ValueError(f"moe_ep={cfg.moe_ep} must be at least 1 and divide tp={cfg.tp}")
         self.attn_tp = resolve_attention_tp(self.mcfg, cfg)
         num_pages = pool_pages(cfg, self.mcfg)
         self._workers = []
@@ -290,12 +299,17 @@ class LLMEngine:
         )
         # The scheduler (engine/scheduler.py) runs the served prefix-cache rules for a recurrent model: a hit resumes from
         # the deepest state checkpoint at or below it, checkpoints are written inside prefill chunks and at every page
-        # boundary in decode, and a checkpoint a newer one dominates is freed when its path is released.
-        if self.runner.state is None:
-            raise ValueError("TrnRT serves models with linear-attention layers: this model has no recurrent state")
+        # boundary in decode, and a checkpoint a newer one dominates is freed when its path is released. A model without
+        # recurrent state (GLM-5.3) resumes from any cached page and checkpoints nothing (Scheduler.stateless).
         self.scheduler = Scheduler(scfg, self.pool, self.radix, draft_fn=self._propose if cfg.spec_method else None)
-        self.scheduler.states = self.runner.state  # checkpoint rows of the state pool back the radix nodes
-        self.radix.free_ckpt = self.runner.state.free_ckpt
+        state = self.runner.state
+        if state is None:
+            if cfg.spec_method:
+                raise ValueError("speculative decoding of a model without recurrent state is not supported yet")
+            self.scheduler.stateless = self.radix.stateless = True
+        else:
+            self.scheduler.states = state  # checkpoint rows of the state pool back the radix nodes
+            self.radix.free_ckpt = state.free_ckpt
         # Host memory under the radix cache (engine/host_cache.py), per rank: half for state checkpoints, the rest for
         # KV pages. Evicted pages and checkpoints go there (a checkpoint on a running request's path too, when no row is
         # free), and a later hit copies them back.
@@ -304,8 +318,10 @@ class LLMEngine:
             from .host_cache import HostTier
 
             budget = cfg.host_cache_gb * 2**30
-            ckpts = max(1, int(budget / 2 // self.runner.state.bytes_per_row()))
-            budget -= ckpts * self.runner.state.bytes_per_row()
+            ckpts = 0
+            if state is not None:
+                ckpts = max(1, int(budget / 2 // state.bytes_per_row()))
+                budget -= ckpts * state.bytes_per_row()
             page_bytes = self.runner.kv_page_bytes()
             pages = int(budget // page_bytes) if page_bytes else cfg.max_num_seqs * cfg.max_pages_per_seq
             self.host_tier = HostTier(self.runner, cfg.page_size, max(1, pages), ckpts)

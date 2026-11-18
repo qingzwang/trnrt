@@ -80,6 +80,9 @@ class EngineConfig:
     # Selected-expert MoE: "nki" (trnrt/kernels) or "xla" (the gather in DecoderForCausalLM._moe). None: "nki" on a
     # NeuronCore and in a capture of one (device "meta"), the served path; "xla" on CPU, where NKI kernels do not run.
     moe_kernel: str | None = None
+    # Expert parallelism of the routed experts: groups of tp / moe_ep ranks, each holding E / moe_ep experts
+    # (models/glm_moe_dsa.py MOE_EP). GLM-5.3 only; 1: every rank holds every expert's columns.
+    moe_ep: int = 1
     # Layers per piecewise graph, MoE layers included, for decode and for prefill chunks.
     piecewise_moe_group: int = 12
     piecewise_prefill_moe_group: int = 12

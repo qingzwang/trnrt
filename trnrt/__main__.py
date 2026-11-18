@@ -238,6 +238,13 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
         help="the selected experts' MoE: the NKI kernels (the served path) or XLA's gather (default: nki on "
         "Neuron, xla on --device cpu, where NKI kernels do not run)",
     )
+    g.add_argument(
+        "--moe-ep",
+        type=int,
+        default=1,
+        help="expert parallelism: groups of tp / moe-ep ranks, each holding 1 / moe-ep of the routed experts (GLM-5.3 "
+        "only; 1: every rank holds every expert's columns)",
+    )
     g.add_argument("--num-layers", type=int, default=None, help="debugging: the first n layers only")
     sp = ap.add_argument_group(
         "speculative decoding",
@@ -422,6 +429,7 @@ def engine_config(argv: list[str], core_base: int = 0):
         tp=a.tp,
         tp_core_base=core_base,
         moe_kernel=a.moe_kernel,
+        moe_ep=a.moe_ep,
         num_layers=a.num_layers,
         max_running=a.max_running,
         kda_shell_max_rows=a.kda_shell_max_rows,

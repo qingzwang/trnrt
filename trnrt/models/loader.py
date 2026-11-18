@@ -1,4 +1,4 @@
-"""Load GLM-5.3-Flash's Hugging Face safetensors checkpoint (native block-scaled FP8) into the model."""
+"""Load a GLM-5.3-Flash or GLM-5.3 Hugging Face safetensors checkpoint (native block-scaled FP8) into the model."""
 
 from __future__ import annotations
 
@@ -8,12 +8,13 @@ import os
 import torch
 from safetensors import safe_open
 
-from . import glm5_next, hybrid, linear_attn, mla
+from . import glm5_next, glm_moe_dsa, hybrid, linear_attn, mla
 from .config import LinearSpec, ModelConfig
 from .decoder import DecoderForCausalLM
 from .quant import FP8, dequant, fit_e4m3_max, quantize_fp8_rows
 
-ARCHITECTURES = {a: DecoderForCausalLM for a in glm5_next.ARCHITECTURES}
+ARCHITECTURES: dict[str, type[DecoderForCausalLM]] = {a: DecoderForCausalLM for a in glm5_next.ARCHITECTURES}
+ARCHITECTURES.update({a: glm_moe_dsa.GlmMoeDsaForCausalLM for a in glm_moe_dsa.ARCHITECTURES})
 
 # Checkpoint tensor names (suffixes after model.layers.{i}.).
 NAMES = {
@@ -268,9 +269,10 @@ def _load_decoder(model: DecoderForCausalLM, path: str, dtype: torch.dtype, fp8_
             put_norm(layer.post_norm, pre + "post_attention_layernorm.weight")
             if isinstance(sp, LinearSpec):
                 linear_attn.load_mixer(layer, ck, pre, cfg, ar, an, dtype, blk, fp8_max)
-            else:
-                mla.load_layer(layer, ck, pre, cfg, ar, dtype,
-                               lambda p_, s_, w_, sc_: _assign(p_, s_, w_, sc_, dtype, blk, fp8_max), _concat, put_norm)
+            else:  # a model class may lay out its own attention (GlmMoeDsaForCausalLM.load_attention)
+                load_attn = getattr(model, "load_attention", mla.load_layer)
+                load_attn(layer, ck, pre, cfg, ar, dtype,
+                          lambda p_, s_, w_, sc_: _assign(p_, s_, w_, sc_, dtype, blk, fp8_max), _concat, put_norm)
             if layer.moe:
                 _load_experts(layer, ck, pre, cfg, r, n, dtype, fp8_max)
                 if layer.shared_gate_up is not None:  # mlp.shared_experts.*
@@ -299,6 +301,9 @@ def _load_decoder(model: DecoderForCausalLM, path: str, dtype: torch.dtype, fp8_
                     dense_half.fill(layer, dtype)
             if not getattr(layer, "plain", False):  # the MTP layer has no hyper-connections
                 hybrid.load_layer(layer, ck, pre, cfg, r, n, dtype)
+            after = getattr(model, "after_layer_load", None)  # GlmMoeDsaForCausalLM: decode's weight copies
+            if after is not None:
+                after(layer)
         except KeyError as e:
             raise KeyError(f"layer {i}: checkpoint is missing {e}") from None
         layer_done()
@@ -311,7 +316,12 @@ def _load_experts(layer, ck: _Checkpoint, pre: str, cfg: ModelConfig, r: int, n:
     and mlp.experts.down_proj [E, H, I]). Accept both; shard I across tensor-parallel ranks.
     FP8 blocks are fitted onto e4m3 max per (row, block) (models/quant.fit_e4m3_max)."""
     E, I = cfg.num_experts, cfg.moe_intermediate_size
-    sl = _part(I, r, n)
+    # Expert parallelism (models/glm_moe_dsa.py MOE_EP): the layer holds experts first .. first + E' - 1, each at the
+    # columns of its rank within the expert group; without it, every expert at this rank's columns of the tp ranks.
+    first = getattr(layer, "_ep_first", 0)
+    er, en = getattr(layer, "_ep_tp", (r, n))
+    El = layer.w_gu.shape[0]
+    sl = _part(I, er, en)
     nm = names(cfg)
     layer.router.data.copy_(ck.get(pre + nm["router"]).to(dtype))
     if layer.router_bias is not None:
@@ -319,14 +329,16 @@ def _load_experts(layer, ck: _Checkpoint, pre: str, cfg: ModelConfig, r: int, n:
     m = pre + "mlp.experts."
     bk = cfg.quant_expert_block
     if m + "gate_up_proj" in ck:
-        gu = ck.get(m + "gate_up_proj")
+        gu = ck.get(m + "gate_up_proj")[first : first + El]
         _assign_experts(layer, torch.cat([gu[:, sl], gu[:, I:][:, sl]], dim=1), None,
-                        ck.get(m + "down_proj")[:, :, sl], None, dtype, bk, fp8_max)
+                        ck.get(m + "down_proj")[first : first + El][:, :, sl], None, dtype, bk, fp8_max)
         return
-    for e in range(E):
-        g, gs = ck.linear(f"{m}{e}.gate_proj", sl, block=bk)
-        u, us = ck.linear(f"{m}{e}.up_proj", sl, block=bk)
-        d, ds = ck.linear(f"{m}{e}.down_proj", cols=sl, block=bk)
+    if first + El > E:
+        raise ValueError(f"experts {first} .. {first + El - 1} past the checkpoint's {E}")
+    for e in range(El):
+        g, gs = ck.linear(f"{m}{first + e}.gate_proj", sl, block=bk)
+        u, us = ck.linear(f"{m}{first + e}.up_proj", sl, block=bk)
+        d, ds = ck.linear(f"{m}{first + e}.down_proj", cols=sl, block=bk)
         gus = torch.cat([gs, us]) if gs is not None else None
         _assign(_Row(layer.w_gu, e), _Row(layer.w_gu_scale, e) if layer.w_gu_scale is not None else None,
                 torch.cat([g, u]), gus, dtype, bk, fp8_max)

@@ -26,7 +26,7 @@
 | `trnrt/engine/spec_async.py`, `spec_synth.py` | Speculative decoding: the per-request board of device-side state the next step reads (accepted count, newest token, positions, state row, drafts), and the benchmark mode's synthetic acceptance. |
 | `trnrt/engine/tp.py` | Tensor parallelism. Rank 0 drives, the other ranks follow, through shared memory or gloo. |
 | `trnrt/engine/start_checks.py`, `start_lock.py`, `watchdog.py` | Host checks before start, one engine starting at a time, and turning a device hang into a clean exit. |
-| `trnrt/models/` | GLM-5.3-Flash: the decoder, KDA linear attention, DSA sparse attention, mHC, the MoE, and FP8 loading. |
+| `trnrt/models/` | GLM-5.3-Flash: the decoder, KDA linear attention, DSA sparse attention, mHC, the MoE, and FP8 loading. GLM-5.3 (`glm_moe_dsa.py`): RoPE MLA with a token-level DSA indexer shared across layers, on the same decoder. |
 | `trnrt/kernels/` | NKI kernels: decode megakernels, prefill kernels, in-kernel collectives ([MEGAKERNELS.md](MEGAKERNELS.md)). |
 | `trnrt/compile/` | The offline pipeline: shapes from safetensors headers, capture of every graph, a neuronx-cc farm, NEFF strip. |
 | `docker/` | The image (base pinned by digest) and `check_image.py`, which checks every Neuron piece at build time. |
@@ -65,18 +65,20 @@ Neuron SDK misses.
 
 ## Adding a model family
 
-TrnRT serves one model family today. The model-facing contract a second family must meet:
+TrnRT serves two model families. GLM-5.3-Flash is the hybrid one (KDA + DSA + mHC) the kernels are built for. GLM-5.3
+is early: [KNOWN_ISSUES.md](KNOWN_ISSUES.md#glm-53-early-not-yet-tuned) has its numbers and what it lacks.
 
-| Layer | Today | What a new family provides |
-|---|---|---|
-| Config | `ModelConfig.from_config_dict` dispatches on `architectures` to `glm5_next.config_from_hf` | A `config_from_hf` for its architecture names |
-| Weights | `loader.ARCHITECTURES` maps the architecture to `DecoderForCausalLM`, and the loader knows GLM's tensor names | Its tensor-name map and any packing |
-| Model | `ModelRunner` calls `kv_shapes`, `bind_kv_cache`, `aux_kv_shapes`, `bind_aux_kv`, `state_shapes`, `token_state_shapes`, `forward_decode`, `forward_prefill`, `layer_kind` and `group_fn` | The same methods on its model class |
-| Engine | `engine.py` sets the KDA and DSA decode routes and requires recurrent state | Its own routes, or none |
-| Chat | `serve/parsers.py` parses GLM's reasoning and tool-call format | A parser for its output format |
+| Layer | GLM-5.3-Flash | GLM-5.3 | What a new family provides |
+|---|---|---|---|
+| Config | `glm5_next.config_from_hf` | `glm_moe_dsa.config_from_hf` | A `config_from_hf` and `ARCHITECTURES`, listed in `ModelConfig.from_config_dict` |
+| Weights | `DecoderForCausalLM`, `mla.load_layer` | `GlmMoeDsaForCausalLM.load_attention`; the rest of the loader is shared | An entry in `loader.ARCHITECTURES`, and a `load_attention` if its attention tensors differ |
+| Model | hyper-connection layers | plain residual layers (`DecoderLayer` `plain`) | A `DecoderForCausalLM` subclass overriding `_layer`, `_hidden_in`, `_final` and `forward_logits` |
+| Engine | recurrent state: prefix hits resume from state checkpoints | no recurrent state: a hit resumes from any cached page (`Scheduler.stateless`) | Nothing, unless it adds a new kind of state |
+| Chat | `serve/parsers.py` | the same GLM format | A parser for its output format |
 
-The router, the page pool, the sampler, tensor parallelism and the compile cache layout do not depend on the model.
-The engine, scheduler and prefix caches still assume a hybrid model with recurrent state (the engine refuses a model
-without it), and the compile steps know GLM's tensor names. A second family starts by lifting those assumptions. Open a
+A subclass leaves the existing traced code alone. GLM-5.3 changed one constructor line of `decoder.py` in place (its
+layers are `plain` when the config has no hyper-connections): no line moved, and constructors run before tracing, so
+GLM-5.3-Flash's graphs should not change. `tools/graph_equiv.py` has not checked that yet. The router, the
+page pool, the sampler, tensor parallelism and the compile cache layout do not depend on the model. Open a
 [model request](https://github.com/RunanywhereAI/trnrt/issues/new?template=30-model-request.yml) to discuss a family
 before starting on one.

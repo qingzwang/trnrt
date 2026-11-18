@@ -36,7 +36,9 @@ for credit, not because their licenses require it.
 ## Models and services this code works with
 
 GLM-5.3-Flash (`zai-org/GLM-5.3-Flash` on Hugging Face) is released under the MIT license; its weights are downloaded at run
-time and are not part of this repository. The AWS Neuron SDK (neuronx-cc, NKI, the Neuron runtime) is installed separately
+time and are not part of this repository. GLM-5.3 (`zai-org/GLM-5.3`) is released under its own GLM-5.3 License (`LICENSE`
+in that repository); no file of it is included here (`tests/test_glm_moe_dsa.py` builds its test models from the
+published geometry), and its weights are downloaded at run time. The AWS Neuron SDK (neuronx-cc, NKI, the Neuron runtime) is installed separately
 under AWS's terms.
 
 ## License texts

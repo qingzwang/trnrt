@@ -107,8 +107,10 @@ def test_clear_drops_everything():
     assert len(t.free_slots) == 2 and len(t.free_ckpt_slots) == 1
 
 
-def test_both_parts_need_room():
-    with pytest.raises(ValueError, match="room for at least one page and one state checkpoint"):
-        HostTier(Moves(), page_size=2, capacity_pages=1, capacity_ckpts=0)
-    with pytest.raises(ValueError, match="room for at least one page and one state checkpoint"):
+def test_pages_need_room_checkpoints_may_have_none():
+    """A model without recurrent state has no checkpoint part (engine.py sizes it 0); every tier holds a page."""
+    assert HostTier(Moves(), page_size=2, capacity_pages=1, capacity_ckpts=0).ckpt_capacity == 0
+    with pytest.raises(ValueError, match="room for at least one page"):
         HostTier(Moves(), page_size=2, capacity_pages=0, capacity_ckpts=1)
+    with pytest.raises(ValueError, match="room for at least one page"):
+        HostTier(Moves(), page_size=2, capacity_pages=1, capacity_ckpts=-1)

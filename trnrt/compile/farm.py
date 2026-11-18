@@ -417,8 +417,10 @@ def cmd_decisions(a, dirs) -> int:
         prefixes=a.layers.split(",") if a.layers else None,
         procs=a.procs,
         revision=a.revision,
+        ep=a.moe_ep,
     )
-    mine = {k: v for k, v in rec["decisions"].items() if k.startswith(f"fp8_max={fp8_max:g} tp={a.tp} ")}
+    ep = f"ep={a.moe_ep} " if a.moe_ep > 1 else ""
+    mine = {k: v for k, v in rec["decisions"].items() if k.startswith(f"fp8_max={fp8_max:g} tp={a.tp} {ep}")}
     vals = sorted({(v["moe_prefill_dq"], v["moe_prefill_down"]) for v in mine.values()})
     print(
         f"{shape_dir}/{capture.DECISIONS}: {len(mine)} (layer, rank) decisions at fp8_max={fp8_max:g} "
@@ -572,6 +574,7 @@ def build_parser() -> argparse.ArgumentParser:
     dc.add_argument("--revision", default=None, help="the repo's commit (default: its current one, recorded)")
     dc.add_argument("--shape-dir", default=None, help="default <out>/shapes")
     dc.add_argument("--tp", type=int, default=32, help="tensor-parallel ranks of the engine (default %(default)s)")
+    dc.add_argument("--moe-ep", type=int, default=1, help="the engine's expert parallelism (default %(default)s)")
     dc.add_argument("--ranks", default="all", help="all, or a comma list")
     dc.add_argument("--layers", default=None, help="comma list of layer prefixes (default: every MoE layer)")
     dc.add_argument("--procs", type=int, default=16, help="worker processes (default %(default)s)")

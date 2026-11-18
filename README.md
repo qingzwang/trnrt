@@ -121,6 +121,7 @@ The full guide covers what each step needs, start-up checks, the batch 4, 8 and 
 |---|---|
 | **AWS Trainium2**, `trn2.48xlarge` (16 chips, 2 engines × TP 32, LNC 2) | ✅ Supported |
 | **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** (320B MoE, 18B active, FP8, 1M-token context) | ✅ Supported |
+| **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)** (FP8, 755 GB of weights) | 🚧 Early: one engine of 64 ranks, not yet tuned ([known issues](docs/KNOWN_ISSUES.md#glm-53-early-not-yet-tuned)) |
 | More open models | 🔜 Coming soon. [Request a model](https://github.com/RunanywhereAI/trnrt/issues/new?template=30-model-request.yml) |
 
 GLM-5.3-Flash is where TrnRT starts. The engine, router, caches and compile pipeline are built to carry more model

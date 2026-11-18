@@ -219,11 +219,11 @@ _PENDING: list = [None]
 _ACTIVE: list = [None]  # the (record, key) of the pack_experts call in progress
 
 
-def decision_key(fp8_max: float, tp: int, rank: int, pre: str) -> str:
+def decision_key(fp8_max: float, tp: int, rank: int, pre: str, ep: int = 1) -> str:
     """What a decision depends on besides the checkpoint: the e4m3 limit the loader refits FP8
-    weights to (models/quant.fit_e4m3_max; platform.fp8_max), the expert shard (tp, rank) and the
-    layer (its prefix)."""
-    return f"fp8_max={fp8_max:g} tp={tp} rank={rank} {pre}"
+    weights to (models/quant.fit_e4m3_max; platform.fp8_max), the expert shard (tp, rank, and the
+    expert parallelism ep when it is above 1: models/glm_moe_dsa.py MOE_EP) and the layer (its prefix)."""
+    return f"fp8_max={fp8_max:g} tp={tp}{f' ep={ep}' if ep > 1 else ''} rank={rank} {pre}"
 
 
 def read_decisions(shape_dir: str) -> dict:
@@ -248,7 +248,8 @@ def _install_decisions() -> None:
 
     def _load_experts(layer, ck, pre, cfg, r, n, dtype, fp8_max=240.0):
         rec = getattr(ck, "_trnrt_decisions", None)
-        _PENDING[0] = (layer, rec, decision_key(fp8_max, n, r, pre)) if rec is not None else None
+        ep = n // layer._ep_tp[1] if getattr(layer, "_ep_tp", None) else 1  # the layer's expert group shard
+        _PENDING[0] = (layer, rec, decision_key(fp8_max, n, r, pre, ep)) if rec is not None else None
         return real_load(layer, ck, pre, cfg, r, n, dtype, fp8_max)
 
     def pack_experts(self):
@@ -411,7 +412,7 @@ class _LocalTensors:
 
 def _layer_decisions(source: str, revision: str | None, pre: str, tp: int, ranks: list[int], fp8_max: float,
                      dtype: torch.dtype = torch.bfloat16, table: dict | None = None,
-                     cfg_dir: str | None = None) -> dict:
+                     cfg_dir: str | None = None, ep: int = 1) -> dict:
     """The decisions of one MoE layer for each rank: the rank's shard of expert e through the loader's
     own path (loader._load_experts: the shard, models/quant.fit_e4m3_max), packed by
     moe_dedupe.pack as DecoderLayer.pack_experts packs it, for e = 0, 1, ... until `decide` has both
@@ -433,7 +434,8 @@ def _layer_decisions(source: str, revision: str | None, pre: str, tp: int, ranks
     ck = loader._Checkpoint.__new__(loader._Checkpoint)
     _set_handle(ck, handle)
     E, I = cfg.num_experts, cfg.moe_intermediate_size
-    Im, m = I // tp, pre + "mlp.experts."
+    sub = tp // ep  # ranks per expert group (ep 1: every rank holds every expert)
+    El, Im, m = E // ep, I // sub, pre + "mlp.experts."
     H = ck.shape(f"{m}0.down_proj.weight")[0]
     bk = cfg.quant_expert_block or 128
     router = ck.shape(pre + loader.names(cfg)["router"])
@@ -453,15 +455,18 @@ def _layer_decisions(source: str, revision: str | None, pre: str, tp: int, ranks
                     router=z(*router, dt=torch.bfloat16), down_t=True,
                     router_bias=z(E) if cfg.router_bias else None,
                     router_logit_bias=z(E, dt=torch.bfloat16) if getattr(cfg, "router_logit_bias", False) else None,
-                    w_gu=z(E, 2 * Im, H, dt=FP8), w_gu_scale=z(E, 2 * Im, H // bk),
-                    w_down=z(E, Im, H, dt=FP8), w_down_scale=z(E, 1, H))
+                    w_gu=z(El, 2 * Im, H, dt=FP8), w_gu_scale=z(El, 2 * Im, H // bk),
+                    w_down=z(El, Im, H, dt=FP8), w_down_scale=z(El, 1, H))
+                if ep > 1:  # the rank's expert group, as models/glm_moe_dsa.py _init_ep lays it out
+                    layer._ep_first, layer._ep_tp = (r // sub) * El, (r % sub, sub)
                 loader._load_experts(layer, ck, pre, cfg, r, tp, dtype, fp8_max)
-                for e in sorted(experts) if experts else range(1, E):
+                for e in sorted(experts) if experts else range(1, El):
                     yield mdd.pack(layer.w_gu[e:e + 1], layer.w_gu_scale[e:e + 1], layer.w_down[e:e + 1],
                                    layer.w_down_scale[e:e + 1])
 
         dq, down, n = decide(blobs(), H)
-        out[decision_key(fp8_max, tp, r, pre)] = {"moe_prefill_dq": dq, "moe_prefill_down": down, "experts_read": n}
+        out[decision_key(fp8_max, tp, r, pre, ep)] = {"moe_prefill_dq": dq, "moe_prefill_down": down,
+                                                      "experts_read": n}
     return out
 
 
@@ -482,7 +487,7 @@ def moe_prefixes(index: dict[str, list]) -> list[str]:
 
 
 def compute_decisions(source: str, shape_dir: str, tp: int, fp8_max: float = 240.0, ranks=None, prefixes=None,
-                      procs: int = 16, revision: str | None = None) -> dict:
+                      procs: int = 16, revision: str | None = None, ep: int = 1) -> dict:
     """Write DECISIONS into shape_dir for every MoE layer and rank (merged with what it holds), from
     the real checkpoint: a local directory or a Hugging Face repo id (range reads, no download)."""
     import multiprocessing
@@ -501,8 +506,8 @@ def compute_decisions(source: str, shape_dir: str, tp: int, fp8_max: float = 240
     t0 = time.time()
     with ProcessPoolExecutor(max_workers=procs, mp_context=multiprocessing.get_context("spawn"),
                              initializer=torch.set_num_threads, initargs=(4,)) as ex:
-        jobs = [ex.submit(_layer_decisions, source, revision, p, tp, ranks, fp8_max, table=table, cfg_dir=cfg_dir)
-                for p in prefixes]
+        jobs = [ex.submit(_layer_decisions, source, revision, p, tp, ranks, fp8_max, table=table, cfg_dir=cfg_dir,
+                          ep=ep) for p in prefixes]
         for got in (j.result() for j in jobs):
             rec["decisions"].update(got)
     rec.update(model=source, revision=revision, written=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

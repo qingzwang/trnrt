@@ -31,8 +31,8 @@ class HostTier:
     def __init__(self, runner, page_size: int, capacity_pages: int, capacity_ckpts: int):
         """runner: the device copies, kv_save / kv_load / kv_drop (slot, page) and state_save /
         state_load / state_drop (slot, row); capacities in host slots of one page or one state row."""
-        if capacity_pages < 1 or capacity_ckpts < 1:
-            raise ValueError("the host cache needs room for at least one page and one state checkpoint")
+        if capacity_pages < 1 or capacity_ckpts < 0:
+            raise ValueError("the host cache needs room for at least one page")
         self.runner, self.ps, self.capacity = runner, page_size, capacity_pages
         self.entries: OrderedDict[int, int] = OrderedDict()  # page hash -> host slot
         self.free_slots = list(range(capacity_pages - 1, -1, -1))

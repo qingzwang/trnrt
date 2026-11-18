@@ -25,6 +25,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests import device_kernels
 from trnrt.kernels import kda_half as KH
 from trnrt.kernels import kda_shell as KS
 from trnrt.kernels import mhc_mix as MM
@@ -874,6 +875,7 @@ def test_the_batched_conv_is_the_row_at_a_time_conv_bit_for_bit(T, grid, mix, pa
 
 
 @pytest.mark.skipif(not NKI, reason="needs the NKI package (Neuron venv)")
+@device_kernels.simulator_only()
 def test_the_batched_conv_traces_fewer_transposes(monkeypatch):
     """The positive control: at T = 6 the row-at-a-time conv traces 2 x 6 x 3 hp transposes, the batched one 2 x 3 hp;
     equal traces would make the bit-equality above compare a form with itself."""

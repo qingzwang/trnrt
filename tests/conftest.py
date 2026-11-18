@@ -1,6 +1,7 @@
 """Suite-wide fixtures."""
 
 import logging
+import os
 
 import pytest
 
@@ -17,3 +18,9 @@ def _restore_trnrt_logging():
     root.handlers[:] = handlers
     root.setLevel(level)
     root.propagate = propagate
+
+
+if os.environ.get("TRNRT_TEST_DEVICE") == "1":  # the kernels' simulator tests on a NeuronCore (tests/device_kernels.py)
+    from tests import device_kernels
+
+    device_kernels.install()

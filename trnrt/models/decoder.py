@@ -323,7 +323,7 @@ class DecoderForCausalLM(nn.Module):
         self.register_buffer("vocab_start_t", torch.tensor(self.vocab_start, dtype=torch.int64), persistent=False)
         self.layers = nn.ModuleList(DecoderLayer(cfg, specs[i], dtype, tp_size, tp_rank, moe=i in cfg.moe_layers,
                                                  index=i, keep_fp8=keep_fp8, moe_kernel=moe_kernel,
-                                                 attn_tp=self.attn_tp, attn_rank=self.attn_rank)
+                                                 attn_tp=self.attn_tp, attn_rank=self.attn_rank, plain=not cfg.hybrid)
                                     for i in range(cfg.num_layers))
         self.norm = nn.Parameter(torch.empty(cfg.hidden_size, dtype=dtype), requires_grad=False)
         self.lm_head = (

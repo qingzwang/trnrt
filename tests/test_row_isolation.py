@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from tests import device_kernels
 from tests import test_kda_shell as TKS
 from trnrt.kernels import kda_shell as KS
 from trnrt.kernels import rowiso as RI
@@ -355,6 +356,7 @@ def _per_trace(d0: dict, d1: dict, want: dict) -> bool:
 
 @needs_nki
 @needs_nki
+@device_kernels.simulator_only()
 def test_fin2_traces_differently_from_fin1(monkeypatch):
     """The positive control: per program, kda_shell fin 2 traces 7 tensor_scalar and 3 tensor_tensor fewer and 1
     scalar_tensor_tensor more than fin 1: fin 1's three finite_or_zero sites (5 instructions each: ft and beta, and the

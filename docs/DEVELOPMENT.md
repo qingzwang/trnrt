@@ -30,6 +30,7 @@ docker run --rm --entrypoint python trnrt -m pytest
 | Private trace scan | `tests/test_no_trace.py`'s scan for the maintainers' private patterns, and its positive control | `TRNRT_TRACE_PATTERNS` = the maintainers' patterns file, kept outside the repository |
 | Graph equivalence | `tools/graph_equiv.py` over captured graphs | `libtorch_neuronx_lite`, or `HLO_PB2_PATH` = a directory holding `hlo_pb2.py`, plus `zstd` |
 | Device | `docker/check_image.py --device`, `tools/check_mixed.py`, serving | A Trainium2 host |
+| Kernels on a NeuronCore | Every `nki.simulate` call of the kernel tests run on the device instead (`tests/device_kernels.py`): the kernel compiled through `wrap_nki` as the engine compiles it, its output against the same reference. Grid-1 cases are skipped on an LNC 2 device; tests that inspect the simulator itself are marked simulator-only | A Trainium2 host, `TRNRT_TEST_DEVICE=1`, optionally `NEURON_RT_VISIBLE_CORES` (default 0) |
 
 Two tests document known limits rather than bugs. `tests/test_dsa_long.py::test_cp_engine_matches_replicated` is a
 strict expected failure ([KNOWN_ISSUES.md](KNOWN_ISSUES.md)).

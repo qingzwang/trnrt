@@ -39,6 +39,43 @@ from the exact selection.
   the same counts when it closes (stderr), EXACT only if no row went past the limit: at INFO when EXACT, at WARNING
   when NOT EXACT, so `TRNRT_LOG_LEVEL=WARNING` still shows an inexact run.
 
+## GLM-5.3: early, not yet tuned
+
+GLM-5.3 (`zai-org/GLM-5.3`, `GlmMoeDsaForCausalLM`) loads, prefills and decodes through the engine. It matches
+transformers 5.17.0 on CPU (`tests/test_glm_moe_dsa.py`) and on the real checkpoint's first 4 layers (fp32, CPU). The
+full model runs on one trn2.48xlarge as one engine of 64 ranks, from a cache built by `trnrt compile`.
+
+Measured once each (no repeats), 2026-11-17: trn2.48xlarge, the image of `docker/Dockerfile` (Neuron SDK 2.32,
+neuronx-cc 2.27), `zai-org/GLM-5.3` at ba32f8c19c8738e2c57c71798c601d477a7bf844, bf16 activations with the checkpoint's
+FP8 weights, a bf16 KV cache, `--tp 64 --moe-kernel nki --moe-ep 2 --page-size 32 --max-num-seqs 4 --max-model-len 4096
+--decode-buckets 1,4 --prefill-buckets 512 --page-buckets 16,128`, no speculation. Decode is the steady-state step (the
+difference of a 72- and an 8-token greedy generation over 64-token prompts, so prefill cancels out); prefill is one
+2,000-token prompt that hits nothing in the prefix cache. Correctness was checked by reading two greedy chat answers.
+
+| Configuration | Decode, batch 1 | Decode, batch 4 | Prefill, 2,000 tokens |
+|---|---|---|---|
+| XLA MoE, tp 64 | 190 ms/step | 258 ms/step | 508 s |
+| NKI MoE, tp 64 / ep 2 | 174.5 ms/step | 192.9 ms/step | 3.17 s |
+| + decode projection kernel (`kernels/gemv_tiled.py`) | 33.9 ms/step | 48.6 ms/step | 3.04 s |
+
+| Missing | Why it matters |
+|---|---|
+| Decode megakernels and context-parallel DSA | Flash's fused layer kernels assume NoPE MLA with a pooled indexer. GLM-5.3's attention is XLA: each rank holds every sequence's whole latent and attends over the whole context with a mask. |
+| FP8 decode weights | The decode projection kernel reads bf16 copies made at load: +3.9 GB a rank, and most of a step's 4.4 GB of HBM reads. |
+| Sequence-parallel prefill streams | Off for GLM-5.3: every rank runs every row of a chunk. |
+| MTP speculative decoding | Its MTP layer (`model.layers.78`) is not built, and the engine refuses `--spec-method` for it. |
+| FP8 KV precision | The FP8 cache rounds the rope key and the indexer key to e4m3 (scale 1). On a random tiny model that changes greedy output from the first token on. Not measured on the real weights. |
+| Long contexts | Measured at up to 4,096 tokens only. |
+
+## Kernels on Neuron SDKs after 2.32
+
+On the Neuron vLLM venv's libtorch-neuronx-lite 2.13 (neuronx-cc 2.28), trnrt compiles NKI kernels through its native
+backend (`platform.compile_backend`); the XLA backend's lowering does not find their registration. 19 of the 22 kernel test
+files pass on a NeuronCore there (`TRNRT_TEST_DEVICE=1`). `kda_decode` and the FFN half at grid 2, and the NKI MoE inside
+a whole Flash decode graph, fail to compile with neuronx-cc's internal error NCC_ILMM003 ("Matmult psum accumulation
+flags need to be all set or all unset"). They compile and run on SDK 2.32. The native backend also ignores
+`NEURON_LIBTORCH_ASSERT_CACHE_HIT`, so a start without `--allow-compile` compiles a missing graph instead of failing.
+
 ## Batch 12 beyond 32 agents: the host-side prompt cache fills
 
 Past its peak load, batch size 12 runs into the host-side tier of the prompt cache. In a run at 48 agents, one

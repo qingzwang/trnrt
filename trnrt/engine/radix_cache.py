@@ -96,6 +96,9 @@ class RadixCache:
         # which path_hash keeps per node, so a checkpoint eviction needn't rebuild and rehash the path.
         self.offload_ckpt_hash: Callable[[int, int], None] | None = None
         self.num_ckpts = 0
+        # A model without recurrent state (GLM-5.3: attention layers only) resumes from any cached page, so every
+        # node counts as checkpointed (match_checkpoint). Set by the engine.
+        self.stateless = False
         self.num_dominated_freed = 0
         self.num_running_offloaded = 0
         self._session_nodes: dict[str, list[RadixNode]] = {}
@@ -336,8 +339,10 @@ class RadixCache:
         """The longest cached prefix of `ids` (at most max_pages pages) whose recurrent state was
         checkpointed, ending at a node with `ckpt` (or the root: position 0, zero state), and the
         page count of the plain KV match, which may run further (a junction no checkpoint covers
-        yet)."""
+        yet). Without recurrent state (stateless) that is the plain KV match itself."""
         m = self.match_prefix(ids, max_pages)
+        if self.stateless:
+            return m, m.num_pages
         node, n = m.node, m.num_pages
         while node is not self.root and node.ckpt is None:
             n -= len(node.pages)

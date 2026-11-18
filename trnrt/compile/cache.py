@@ -154,8 +154,16 @@ def cache_key(gm, example_inputs, options: dict) -> str:
     cache.create_cache_hash), on a copy, so the graph LNL then receives is untouched."""
     import copy
 
-    from libtorch_neuronx_lite.compile import cache
-    from libtorch_neuronx_lite.compile.backend import _apply_platform_compiler_args, preprocess_and_validate_inputs
+    from libtorch_neuronx_lite.compile import backend, cache
 
-    gm2, inputs = preprocess_and_validate_inputs(copy.deepcopy(gm), list(example_inputs), options)
-    return cache.create_cache_hash(gm2, inputs, _apply_platform_compiler_args(options))
+    gm2, inputs = backend.preprocess_and_validate_inputs(copy.deepcopy(gm), list(example_inputs), options)
+    # SDK 2.32's LNL has the private _apply_platform_compiler_args; later releases resolve scoped arguments first, then
+    # apply the public apply_platform_compiler_args (compile/backend.py compile()), and the cache hash reads the result.
+    apply = getattr(backend, "apply_platform_compiler_args", None)
+    scoped = getattr(backend, "apply_scoped_compiler_args", lambda o: o)
+    if apply is None:  # SDK 2.32: the private function, and no scoped arguments
+        apply, scoped = getattr(backend, "_apply_platform_compiler_args", None), (lambda o: o)
+    if apply is None:
+        raise RuntimeError("libtorch_neuronx_lite.compile.backend has no platform compiler-argument function")
+    resolved = apply(scoped(options))
+    return cache.create_cache_hash(gm2, inputs, resolved)

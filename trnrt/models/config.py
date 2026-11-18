@@ -1,4 +1,4 @@
-"""The model configuration: the subset of GLM-5.3-Flash's config.json the model code reads."""
+"""The model configuration: the subset of a GLM-5.3-Flash or GLM-5.3 config.json the model code reads."""
 
 from __future__ import annotations
 
@@ -123,12 +123,14 @@ class ModelConfig:
     @classmethod
     def from_config_dict(cls, c: dict, eos_ids: tuple[int, ...] = ()) -> "ModelConfig":
         """from_pretrained on a config.json already read."""
-        from . import glm5_next
+        from . import glm5_next, glm_moe_dsa
 
         arch = (c.get("architectures") or [None])[0]
-        if arch not in glm5_next.ARCHITECTURES:
-            raise NotImplementedError(f"architecture {arch} is not supported (have {list(glm5_next.ARCHITECTURES)})")
-        return glm5_next.config_from_hf(cls, c, eos_ids)
+        for family in (glm5_next, glm_moe_dsa):
+            if arch in family.ARCHITECTURES:
+                return family.config_from_hf(cls, c, eos_ids)
+        have = [*glm5_next.ARCHITECTURES, *glm_moe_dsa.ARCHITECTURES]
+        raise NotImplementedError(f"architecture {arch} is not supported (have {have})")
 
     @staticmethod
     def _quant(c: dict) -> dict:

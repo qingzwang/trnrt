@@ -145,8 +145,8 @@ def canonical_neuron_backend():
     graph captured on a CPU host gets the key the device run computes.
     """
     import torch._dynamo as dynamo
-
-    inner = dynamo.lookup_backend("neuron_libtorch")
+    from .. import platform
+    inner = dynamo.lookup_backend(platform.compile_backend())
 
     def backend(gm, example_inputs, **kwargs):
         canonicalize(gm)

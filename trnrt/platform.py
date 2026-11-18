@@ -208,3 +208,16 @@ def describe(runtime: str | None = None) -> dict:
            "cc_args": shlex.join(neuronx_cc_args(runtime or p.target, fp8=False))}
     rec.update(versions())
     return rec
+
+
+def compile_backend() -> str:
+    """The torch.compile backend for graphs on the "neuron" (PrivateUse1) device. SDK 2.32's libtorch-neuronx-lite
+    (2.11) compiles them with "neuron_libtorch". Later releases split it into an XLA route ("neuron_libtorch", for XLA
+    tensors) and a native route for the neuron device (compile/native_backend.py, "neuron_native_lite"); on the native
+    device the XLA route lowers an NKI kernel through a registry its wrap_nki never fills ("0 not in kernel registry"),
+    while the native route compiles trnrt's kernels unchanged."""
+    try:
+        from libtorch_neuronx_lite.compile import native_backend
+    except ImportError:
+        return "neuron_libtorch"
+    return native_backend.register()

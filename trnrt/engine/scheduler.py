@@ -215,6 +215,10 @@ class Scheduler:
         self.ckpt_mid_placed = 0
         self.ckpt_mid_skipped = 0
         self._new_pending: list = []  # (request, pending checkpoint) the current plan created
+        # A model without recurrent state (GLM-5.3) has no state pool: a prefix hit resumes from any cached page, so
+        # nothing is checkpointed and no request waits for another's junction. Set by the engine with the radix
+        # cache's own flag (radix_cache.RadixCache.stateless).
+        self.stateless = False
 
     @property
     def states(self) -> StatePool:
@@ -552,6 +556,8 @@ class Scheduler:
         """A request arriving while another is still prefilling a prefix they share: make the end of the
         shared pages a checkpoint target of the one computing it, if it has not passed it yet, so `req`
         resumes from it."""
+        if self.stateless:
+            return
         for other in self.running:
             if other.is_decoding or other.status is not Status.RUNNING:
                 continue
@@ -563,7 +569,10 @@ class Scheduler:
         """Another running request is computing a prefix `req` shares with it and will checkpoint a
         position of it past what `req` could resume from now (a junction target not yet reached, or a
         saved checkpoint not yet in the tree): admitting `req` now would compute those tokens a second
-        time, so it waits until it can resume from them."""
+        time, so it waits until it can resume from them. Never without recurrent state: there is no checkpoint to
+        wait for."""
+        if self.stateless:
+            return False
         best = None
         for other in self.running:
             if other.status is not Status.RUNNING:
@@ -601,7 +610,9 @@ class Scheduler:
         """Positions past `cached` where this prefill should leave a checkpoint (page multiples
         below the newest token): the radix junction (KV other requests share runs past the last
         checkpoint), the junctions with requests still queued or running (`ahead`), and the
-        prompt's last page boundary."""
+        prompt's last page boundary. None without recurrent state."""
+        if self.stateless:
+            return []
         ps = self.cfg.page_size
         last = (req.num_tokens - 1) // ps * ps
         out = {last}
@@ -612,7 +623,10 @@ class Scheduler:
 
     def _alloc_ckpt(self) -> int | None:
         """A free checkpoint row, evicting a checkpoint of an unlocked node if none is free, then, with
-        the host cache, one on a running request's path (radix_cache.py evict_checkpoints `keep`)."""
+        the host cache, one on a running request's path (radix_cache.py evict_checkpoints `keep`). None without
+        recurrent state."""
+        if self.stateless:
+            return None
         row = self.states.alloc_ckpt()
         if row is None and self.radix.evict_checkpoints(1):
             row = self.states.alloc_ckpt()
@@ -639,7 +653,13 @@ class Scheduler:
         full = self.radix.match_prefix(ids, max_pages=kv_pages)
         chain = page_chain(req, ps) if getattr(host, "ps", None) == ps else None  # the host cache's own hashes
         slots = host.lookup(ids, kv_pages, limit, chain=chain)
-        ck = host.find_ckpt(ids, match.num_pages + 1, kv_pages + len(slots), chain=chain)
+        # (pages the restored match ends on, the host checkpoint slot there); without recurrent state every page
+        # resumes, so all the host holds is kept and there is no checkpoint to restore.
+        ck: tuple[int, int | None] | None
+        if self.stateless:
+            ck = (kv_pages + len(slots), None) if slots else None
+        else:
+            ck = host.find_ckpt(ids, match.num_pages + 1, kv_pages + len(slots), chain=chain)
         keep = max(0, ck[0] - kv_pages) if ck is not None else 0
         host.unpin(slots[keep:])
         slots = slots[:keep]
@@ -660,8 +680,8 @@ class Scheduler:
                 for mine, tree in zip(pages, res.pages[kv_pages:]):
                     if mine != tree:  # someone inserted the same pages meanwhile: keep the tree's
                         self.pool.free([mine])
-            row = self._alloc_ckpt()
-            if row is not None:
+            row = None if ck[1] is None else self._alloc_ckpt()
+            if row is not None and ck[1] is not None:
                 host.load_ckpt(ck[1], row)
                 if not self.radix.attach_checkpoint(ids, ck[0], row):
                     self.states.free_ckpt(row)
