@@ -500,9 +500,15 @@ def _swiglu(model, layer, x, gate_up: str, down: str, dec: bool) -> torch.Tensor
 
 
 def mlp(model, layer, x: torch.Tensor, dec: bool = False) -> torch.Tensor:
-    """The MLP block on its normalised input x [T, H], after its all-reduce (GlmMoeDsaMLP / GlmMoeDsaMoE)."""
+    """The MLP block on its normalised input x [T, H], after its all-reduce (GlmMoeDsaMLP / GlmMoeDsaMoE). A decode
+    call of a packed MoE layer on the device runs the whole block (router, top 8, experts, shared expert) as
+    kernels/glm_moe_half.py's one kernel."""
     if not layer.moe:
         return model._out_reduce(_swiglu(model, layer, x, "gate_up", "down", dec))
+    from ..kernels import glm_moe_half
+
+    if dec and x.device.type != "cpu" and glm_moe_half.takes(layer, x.shape[0]):
+        return model._out_reduce(glm_moe_half.decode_half(model, layer, x))
     y = _experts(model, layer, x, dec)
     if layer.shared_gate_up is not None:
         y = y + _swiglu(model, layer, x, "shared_gate_up", "shared_down", dec)
@@ -571,6 +577,11 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
             blob = torch.empty(gemv_tiled.P, gemv_tiled.tiles(n_in), n_out, dtype=dt, device=w.device)
             setattr(layer, "dt_" + name, nn.Parameter(blob, requires_grad=False))
             names.append("dt_" + name)
+        if getattr(layer, "pack_moe", False) and getattr(layer, "shared_gate_up", None) is not None and getattr(
+                layer, "router_bias", None) is not None:  # the decode MoE block kernel's packed blobs
+            from ..kernels import glm_moe_half, shell
+
+            glm_moe_half.register(layer, self.cfg, shell.programs())
         if layer.nh == 1:  # one head a rank: the MLA decode kernel's bf16 W_UK [dn, r] and W_UV^T [r, dv]
             m = layer.spec.mla
             dn, dv, r = m.qk_nope_head_dim, m.v_head_dim, m.kv_lora_rank
@@ -603,6 +614,10 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
             sc = getattr(layer, name + "_scale", None)
             w = dequant(getattr(layer, name).data, sc.data if sc is not None else None, torch.float32)
             t.data.copy_(gemv_tiled.pack(w, t.dtype))
+        if getattr(layer, "gh_blob_bf16", None) is not None:
+            from ..kernels import glm_moe_half, shell
+
+            glm_moe_half.fill(layer, self.dtype, shell.programs())
         if getattr(layer, "dk_w_uk", None) is not None:
             for name, dst, tr in (("w_uk", layer.dk_w_uk, False), ("w_uv", layer.dk_w_uv_t, True)):
                 sc = getattr(layer, name + "_scale", None)

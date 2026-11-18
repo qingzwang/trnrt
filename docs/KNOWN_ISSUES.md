@@ -59,12 +59,13 @@ difference of a 72- and an 8-token greedy generation over 64-token prompts, so p
 | + decode projection kernel (`kernels/gemv_tiled.py`) | 33.9 ms/step | 48.6 ms/step | 3.04 s |
 | + its weight loads on two DMA queues, the one-head MLA decode kernel (`kernels/mla_decode.py`) | 31.0 ms/step | 44.4 ms/step | 3.04 s |
 | + decode's q_a / kv_a projection as tp column shards, no indexer query below index_topk keys | 29.3 ms/step | 42.9 ms/step | 3.04 s |
+| + the decode MoE block (router, top 8, experts, shared expert) as one kernel (`kernels/glm_moe_half.py`) | 24.4 ms/step | 36.9 ms/step | 3.03 s |
 
 | Missing | Why it matters |
 |---|---|
 | Decode megakernels and context-parallel DSA | Flash's fused layer kernels assume NoPE MLA with a pooled indexer. GLM-5.3's attention is XLA: each rank holds every sequence's whole latent and attends over the whole context with a mask. |
 | FP8 decode weights | The decode kernels read bf16 copies made at load (+1.5 GB a rank). GLM-5.3's FP8 block scales are not powers of two, so the copies cannot be FP8 without a second rounding of every weight. |
-| Collectives and glue between kernels | A decode step is a few hundred kernel calls with XLA ops and 236 all-reduces between them (2 a layer, plus decode's sharded q_a / kv_a). Flash's fused decode shells, with the all-reduce inside the kernel, are not written for GLM-5.3 yet. |
+| Collectives and glue between kernels | A decode step is a few hundred kernel calls with XLA ops and 236 all-reduces between them (2 a layer, plus decode's sharded q_a / kv_a). The MoE block is one kernel; the attention block is still several kernels and XLA ops, its all-reduces outside them. |
 | Sequence-parallel prefill streams | Off for GLM-5.3: every rank runs every row of a chunk. |
 | MTP speculative decoding | Its MTP layer (`model.layers.78`) is not built, and the engine refuses `--spec-method` for it. |
 | FP8 KV precision | The FP8 cache rounds the rope key and the indexer key to e4m3 (scale 1). On a random tiny model that changes greedy output from the first token on. Not measured on the real weights. |
