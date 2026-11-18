@@ -10,10 +10,11 @@ layout it loads a weight in. Here the layout is the kernel's: blob[i, c, j] = W[
 128 input rows, the last zero-padded), so a chunk of output columns is one DMA of [128, C, n] that is contiguous on every
 partition, and the PE reads it as the moving operand directly: no transpose, every weight byte read once.
 
-Per chunk of NCH output columns (one PSUM bank of fp32): C matmuls stationary = x^T tile [128, T], moving = the chunk's
-[128, n] of tile c, accumulating in one PSUM tile (accumulate=(c > 0), every flag set), then one copy to SBUF in x's dtype
-and one DMA out. At LNC 2 the programs take alternate chunks (program p: chunks p, p + programs, ...); they share
-nothing. x^T [128, C, T] is loaded once, tile by tile (x is a few rows). Arithmetic: products and sums in the PE's fp32,
+Weights load in super-chunks of G chunks (as many as fit LOAD_BYTES a partition: a small K's chunk alone is mostly
+overhead), each load in SPLIT pieces on the scalar and sync engines' hardware DMA queues. Per chunk of NCH output columns
+(one PSUM bank of fp32): C matmuls stationary = x^T tile [128, T], moving = the chunk's [128, n] of tile c, accumulating
+in one PSUM tile (accumulate=(c > 0), every flag set), then one copy to SBUF in x's dtype and one DMA out. At LNC 2 the
+programs take alternate super-chunks; they share nothing. x^T [128, C, T] is loaded once, tile by tile (x is a few rows). Arithmetic: products and sums in the PE's fp32,
 rounded once to x's dtype; emulate() is that in torch (fp32 matmul, one rounding), so it is close to F.linear's, not
 bit-equal (the PE's K grouping is not XLA's).
 """
@@ -24,6 +25,8 @@ import torch
 
 P = 128
 NCH = 512  # output columns per chunk: one 2 KB PSUM bank of fp32 a partition
+SPLIT = 4  # pieces of each weight load (benchmarked on trn2 at GLM-5.3's w_a: 1 -> 89.2 us, 4 on two queues -> 72.5 us)
+LOAD_BYTES = 32768  # a weight load's bytes on a partition, at most (several chunks a load when K is small)
 
 
 def tiles(K: int) -> int:
@@ -71,19 +74,36 @@ if nki is not None:
             kc = min(P, K - c * P)
             nisa.dma_copy(dst=xt[0:kc, c, :], src=x.ap(pattern=[[1, kc], [K, T]], offset=c * P))
         nq = -(-N // NCH)
-        for j in range(-(-nq // npg)):
-            q = j * npg + pid
-            if q < nq:
-                n0 = q * NCH
-                nw = min(NCH, N - n0)
-                wt = nl.ndarray((P, C, nw), dtype=dt, buffer=nl.sbuf)
-                nisa.dma_copy(dst=wt, src=blob.ap(pattern=[[C * N, P], [N, C], [1, nw]], offset=n0))
-                ps = nl.ndarray((T, nw), dtype=nl.float32, buffer=nl.psum)
-                for c in range(C):
-                    nisa.nc_matmul(dst=ps, stationary=xt[:, c, :], moving=wt[:, c, :], accumulate=(c > 0))
-                ot = nl.ndarray((T, nw), dtype=dt, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=ot, src=ps, engine=nisa.vector_engine)
-                nisa.dma_copy(dst=out.ap(pattern=[[N, T], [1, nw]], offset=n0), src=ot)
+        # Super-chunks of G chunks per weight load: as many as fit LOAD_BYTES on a partition (a small K's chunk alone
+        # is mostly per-chunk overhead), at most every program's share.
+        G = max(1, min(LOAD_BYTES // (C * NCH * 2), -(-nq // npg)))
+        ns = -(-nq // G)
+        for j in range(-(-ns // npg)):
+            sq = j * npg + pid
+            if sq < ns:
+                m0 = sq * G * NCH
+                mw = min(G * NCH, N - m0)
+                wt = nl.ndarray((P, C, mw), dtype=dt, buffer=nl.sbuf)
+                # The load in SPLIT pieces over the K tiles, alternating the scalar and sync engines' hardware DGE
+                # queues (one queue held a w_a call to 361 GB/s on trn2, four pieces on two reached 445 GB/s).
+                cs = -(-C // SPLIT)
+                for s_ in range(SPLIT):
+                    c0 = s_ * cs
+                    c1 = min(C, c0 + cs)
+                    if c0 < c1:
+                        nisa.dma_copy(dst=wt[:, c0:c1, :],
+                                      src=blob.ap(pattern=[[C * N, P], [N, c1 - c0], [1, mw]], offset=c0 * N + m0),
+                                      engine=nisa.engine.scalar if s_ % 2 == 0 else nisa.engine.sync,
+                                      dge_mode=nisa.dge_mode.hwdge)
+                for u in range(-(-mw // NCH)):
+                    u0 = u * NCH
+                    nw = min(NCH, mw - u0)
+                    ps = nl.ndarray((T, nw), dtype=nl.float32, buffer=nl.psum)
+                    for c in range(C):
+                        nisa.nc_matmul(dst=ps, stationary=xt[:, c, :], moving=wt[:, c, u0:u0 + nw], accumulate=(c > 0))
+                    ot = nl.ndarray((T, nw), dtype=dt, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=ot, src=ps, engine=nisa.vector_engine)
+                    nisa.dma_copy(dst=out.ap(pattern=[[N, T], [1, nw]], offset=m0 + u0), src=ot)
         return out
 else:
     gemv_tiled_kernel = None
@@ -96,7 +116,7 @@ def _kernel_rev() -> int:
     src = open(__file__).read()
     a = src.index("# -- the kernel (its span is what REV hashes)")
     b = src.index("    gemv_tiled_kernel = None", a)
-    return zlib.crc32(repr((P, NCH)).encode(), zlib.crc32(src[a:b].encode()))
+    return zlib.crc32(repr((P, NCH, SPLIT, LOAD_BYTES)).encode(), zlib.crc32(src[a:b].encode()))
 
 
 REV = _kernel_rev()

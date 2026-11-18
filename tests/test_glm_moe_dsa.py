@@ -405,6 +405,8 @@ def test_expert_parallel_matches_tp1(model_dir, tp, ep, monkeypatch):
         layer = next(x for x in eng.model.layers if x.moe)
         assert eng.model.moe_ep == ep and layer.ep_experts == 8 // ep
         assert tuple(layer.w_gu.shape[:2]) == (8 // ep, 2 * 128 // (tp // ep))
+        first = eng.model.layers[0]  # decode reads its column shard of w_a, not the replicated weight
+        assert first.dt_w_a_shard.shape[2] == -(-first.w_a.shape[0] // tp) and not hasattr(first, "dt_w_a")
         got = [r.output_ids for r in eng.generate(ps, sp)]
     finally:
         eng.close()
@@ -443,3 +445,19 @@ def test_decode_reads_pretiled_copies_prefill_graphs_do_not(model_dir):
     for i in range(len(m.layers)):
         names = set(m._layer_split(i)[1])
         assert names and not any(n.startswith("dt_") for n in names)
+
+
+def test_mla_decode_kernel_copies_are_the_heads_weights(tmp_path):
+    """At one head a rank (tp = num_heads, as GLM-5.3 at tp 64) each layer holds the MLA decode kernel's copies:
+    dk_w_uk = W_UK [dn, r] and dk_w_uv_t = W_UV^T [r, dv], dequantized, decode-only."""
+    from trnrt.models.config import ModelConfig
+    from trnrt.models.glm_moe_dsa import GlmMoeDsaForCausalLM
+
+    path = str(tmp_path)
+    build(path, layers=2)
+    cfg = ModelConfig.from_pretrained(path)
+    m = GlmMoeDsaForCausalLM(cfg, torch.float32, 64, tp_rank=0, tp_size=4)
+    layer = m.layers[0]
+    assert layer.nh == 1 and tuple(layer.dk_w_uk.shape) == (192, 512) and tuple(layer.dk_w_uv_t.shape) == (512, 256)
+    assert {"dk_w_uk", "dk_w_uv_t"} <= set(layer._decode_only)
+    assert not hasattr(ours(path).layers[0], "dk_w_uk")  # 4 heads at tp 1: the XLA attention

@@ -15,6 +15,7 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - Expert parallelism of the routed experts, `--moe-ep` (GLM-5.3): groups of tp / ep ranks, each holding E / ep experts, so
   the NKI MoE kernels take GLM-5.3 at 64 ranks. `trnrt compile decisions --moe-ep` writes its decisions.
 - `kernels/gemv_tiled.py`: a decode step's projections over weights pre-tiled at load (GLM-5.3's decode).
+- `kernels/mla_decode.py`: GLM-5.3's absorbed-MLA decode attention for one head per rank, as one kernel.
 - The engine serves models without recurrent state: a prefix hit resumes from any cached page, with no state
   checkpoints, and the host-memory tier holds KV pages only.
 - `TRNRT_TEST_DEVICE=1`: the kernel tests' simulator calls run on a NeuronCore ([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#tests)).

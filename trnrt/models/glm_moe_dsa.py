@@ -240,6 +240,24 @@ def _lin(model, layer, x, name: str, dec: bool):
     return F.linear(x, model._w(layer, name))
 
 
+def _w_a_sharded(model, layer, x):
+    """Decode's q_a + kv_a projection [T, ql + r + dr] (replicated on every rank in the prefill graphs, vLLM's and
+    SGLang's MLA layout) as tp column shards: this rank's columns through the projection kernel, placed at its offset in
+    a zero row by a one-hot product (decoder._head's form: the offset is a buffer, so every rank traces one graph) and
+    all-reduced. At tp 64 each rank reads 41 of the 2,624 columns' weights instead of all of them: 32 MB of the 3.55 GB a
+    78-layer batch-1 step read (profiled on trn2), for one more all-reduce a layer. The sum adds zeros to each column's
+    one value, so the row is the replicated projection's."""
+    from ..kernels import gemv_tiled
+
+    T, tp = x.shape[0], model.tp_size
+    blob = layer.dt_w_a_shard
+    local = gemv_tiled.gemv(x.to(blob.dtype), blob)  # [T, n] this rank's columns
+    n = local.shape[1]
+    mine = (torch.arange(tp, device=x.device) * n == model.w_a_lo_t).to(local.dtype)
+    full = (local.unsqueeze(1) * mine.view(1, -1, 1)).reshape(T, tp * n)
+    return model._all_reduce(full)[:, : layer.w_a_cols]
+
+
 def _project(model, layer, x, positions, dec: bool = False):
     """q_nope [T, nh, dn], the rotated q_pe [T, nh, dr], latent c [T, r], the rotated k_pe [T, dr], the normalised q
     latent (the indexer's input) and the angles' (cos, sin) [T, dr / 2] (GlmMoeDsaAttention.forward): models/mla.py
@@ -247,7 +265,10 @@ def _project(model, layer, x, positions, dec: bool = False):
     m = layer.spec.mla
     T = x.shape[0]
     dn, dr, r, ql = m.qk_nope_head_dim, m.qk_rope_head_dim, m.kv_lora_rank, m.q_lora_rank
-    a = _lin(model, layer, x, "w_a", dec)
+    if dec and getattr(layer, "dt_w_a_shard", None) is not None:
+        a = _w_a_sharded(model, layer, x)
+    else:
+        a = _lin(model, layer, x, "w_a", dec)
     q_resid = rms_norm(a[:, :ql], layer.q_a_norm, m.norm_eps)
     kv = a[:, ql:]
     q = _lin(model, layer, q_resid, "q_b", dec).view(T, layer.nh, dn + dr)
@@ -258,18 +279,22 @@ def _project(model, layer, x, positions, dec: bool = False):
     return q_nope, rope(q_pe, cos.unsqueeze(1), sin.unsqueeze(1)), c, rope(k_pe, cos, sin), q_resid, (cos, sin)
 
 
-def _indexer(model, layer, x, q_resid, cs, dec: bool = False):
+def _indexer(model, layer, x, q_resid, cs, dec: bool = False, scores: bool = True):
     """The indexer's query [T, Hi, Di], key [T, Di] and head weights [T, Hi] fp32 (GlmMoeDsaIndexer.forward before
-    scoring): RoPE on the first qk_rope_head_dim dims of each, LayerNorm (eps 1e-6, with bias) on the key first."""
+    scoring): RoPE on the first qk_rope_head_dim dims of each, LayerNorm (eps 1e-6, with bias) on the key first.
+    scores False (a bucket of at most index_topk keys selects nothing): the key alone, for the cache; the query and
+    weights are None, and their weights (16.8 MB of wq_b a full layer at GLM-5.3's shapes) are not read."""
     m = layer.spec.mla
     d = m.dsa
     T, dr = x.shape[0], m.qk_rope_head_dim
     cos, sin = cs
-    q = _lin(model, layer, q_resid, "idx_wq", dec).view(T, d.n_heads, d.head_dim)
-    q = torch.cat([rope(q[..., :dr], cos.unsqueeze(1), sin.unsqueeze(1)), q[..., dr:]], dim=-1)
     k = _lin(model, layer, x, "idx_wk", dec)
     k = F.layer_norm(k.float(), (d.head_dim,), layer.idx_knorm_w.float(), layer.idx_knorm_b.float(), 1e-6).to(x.dtype)
     k = torch.cat([rope(k[..., :dr], cos, sin), k[..., dr:]], dim=-1)
+    if not scores:
+        return None, k, None
+    q = _lin(model, layer, q_resid, "idx_wq", dec).view(T, d.n_heads, d.head_dim)
+    q = torch.cat([rope(q[..., :dr], cos.unsqueeze(1), sin.unsqueeze(1)), q[..., dr:]], dim=-1)
     w = _lin(model, layer, x, "idx_wproj", dec) * d.n_heads ** -0.5
     return q, k, w
 
@@ -366,8 +391,9 @@ def attention(model, layer, x, positions, slot_mapping, table, bias):
     q_nope, q_pe, c, k_pe, q_resid, cs = _project(model, layer, x, positions, dec)
     model._store(layer.k_cache, slot_mapping, torch.cat([c, k_pe], dim=-1).unsqueeze(1))
     idx = None
+    L = table.shape[-1] * model.page_size  # the bucket's keys (static)
     if not m.index_shared:
-        qi, ki, wi = _indexer(model, layer, x, q_resid, cs, dec)
+        qi, ki, wi = _indexer(model, layer, x, q_resid, cs, dec, scores=L > d.topk)
         model._store(layer.v_cache, slot_mapping, ki.unsqueeze(1))
         idx = (qi, wi)
     kc = model._load(layer.k_cache, table).squeeze(-2)  # [(B,) L, r + dr]
@@ -383,7 +409,16 @@ def attention(model, layer, x, positions, slot_mapping, table, bias):
     if L > d.topk:  # static per bucket: below it every visible key is kept
         kI = None if idx is None else model._load(layer.v_cache, table).squeeze(-2).reshape(B, L, d.head_dim)
         vis = vis + _selection(model, layer, idx, kI, vis, B, Q)
-    out = _attend(model, layer, q_nope, q_pe, kc, vis, B, Q, absorb=table.dim() != 1)
+    from ..kernels import mla_decode
+
+    dk = getattr(layer, "dk_w_uk", None)
+    if (dk is not None and bias.dim() == 4 and x.device.type != "cpu"
+            and mla_decode.takes(B, L, m.qk_nope_head_dim, m.qk_rope_head_dim, m.kv_lora_rank)):
+        # a decode batch on the device, one head a rank: kernels/mla_decode.py over the context's rows
+        out = mla_decode.attend(q_nope.reshape(B, -1), q_pe.reshape(B, -1), kc, vis.reshape(B, L), dk,
+                                layer.dk_w_uv_t, m.softmax_scale)
+    else:
+        out = _attend(model, layer, q_nope, q_pe, kc, vis, B, Q, absorb=table.dim() != 1)
     return _lin(model, layer, out, "o", dec)
 
 
@@ -506,14 +541,28 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
         self._rope_buffer(None)
         for layer in self.layers:
             self._init_decode_copies(layer)
+        shard = next((l.dt_w_a_shard for l in self.layers if getattr(l, "dt_w_a_shard", None) is not None), None)
+        self.w_a_lo = self.tp_rank * shard.shape[2] if shard is not None else None
+        if self.w_a_lo is not None:
+            self._w_a_buffer(None)
 
     def _init_decode_copies(self, layer) -> None:
         """The layer's dt_<name> decode copies (DECODE_COPIES, the projection kernel's blobs), filled at load
         (after_layer_load)."""
+        from ..kernels import gemv_tiled
+
         names = []
         for name in (*DECODE_COPIES, *DECODE_COPIES_F32):
             w = getattr(layer, name, None)
             if not isinstance(w, torch.Tensor):
+                continue
+            if name == "w_a" and self.tp_size > 1:  # decode reads its column shard only (_w_a_sharded)
+                n_out, n_in = w.shape
+                n = -(-n_out // self.tp_size)
+                layer.w_a_cols = n_out
+                layer.dt_w_a_shard = nn.Parameter(torch.empty(gemv_tiled.P, gemv_tiled.tiles(n_in), n, dtype=self.dtype,
+                                                              device=w.device), requires_grad=False)
+                names.append("dt_w_a_shard")
                 continue
             from ..kernels import gemv_tiled
 
@@ -522,11 +571,29 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
             blob = torch.empty(gemv_tiled.P, gemv_tiled.tiles(n_in), n_out, dtype=dt, device=w.device)
             setattr(layer, "dt_" + name, nn.Parameter(blob, requires_grad=False))
             names.append("dt_" + name)
+        if layer.nh == 1:  # one head a rank: the MLA decode kernel's bf16 W_UK [dn, r] and W_UV^T [r, dv]
+            m = layer.spec.mla
+            dn, dv, r = m.qk_nope_head_dim, m.v_head_dim, m.kv_lora_rank
+            dev = layer.w_uk.device
+            layer.dk_w_uk = nn.Parameter(torch.empty(dn, r, dtype=self.dtype, device=dev), requires_grad=False)
+            layer.dk_w_uv_t = nn.Parameter(torch.empty(r, dv, dtype=self.dtype, device=dev), requires_grad=False)
+            names += ["dk_w_uk", "dk_w_uv_t"]
         layer._decode_only = (*getattr(layer, "_decode_only", ()), *names)
 
     def after_layer_load(self, layer) -> None:
         """Fill the layer's decode copies from the weights the loader just filled (loader._load_decoder), on the host,
         before the layer moves to the device."""
+        if getattr(layer, "dt_w_a_shard", None) is not None:
+            from ..kernels import gemv_tiled
+
+            t = layer.dt_w_a_shard
+            n = t.shape[2]
+            sc = layer.w_a_scale
+            w = dequant(layer.w_a.data, sc.data if sc is not None else None, torch.float32)
+            part = torch.zeros(n, w.shape[1])
+            rows = w[self.tp_rank * n : (self.tp_rank + 1) * n]
+            part[: rows.shape[0]] = rows
+            t.data.copy_(gemv_tiled.pack(part, t.dtype))
         for name in (*DECODE_COPIES, *DECODE_COPIES_F32):
             t = getattr(layer, "dt_" + name, None)
             if t is None:
@@ -536,6 +603,11 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
             sc = getattr(layer, name + "_scale", None)
             w = dequant(getattr(layer, name).data, sc.data if sc is not None else None, torch.float32)
             t.data.copy_(gemv_tiled.pack(w, t.dtype))
+        if getattr(layer, "dk_w_uk", None) is not None:
+            for name, dst, tr in (("w_uk", layer.dk_w_uk, False), ("w_uv", layer.dk_w_uv_t, True)):
+                sc = getattr(layer, name + "_scale", None)
+                w = dequant(getattr(layer, name).data, sc.data if sc is not None else None, torch.float32)
+                dst.data.copy_((w.t() if tr else w).to(dst.dtype))
 
     def _init_ep(self, moe_kernel: str) -> None:
         """This rank's routed experts under expert parallelism (MOE_EP): experts [g E / ep, (g + 1) E / ep) of its group
@@ -596,6 +668,13 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
             self._rope_buffer(device)
         if getattr(self, "moe_ep", 1) > 1:
             self._ep_buffer(device)
+        if getattr(self, "w_a_lo", None) is not None:
+            self._w_a_buffer(device)
+
+    def _w_a_buffer(self, device) -> None:
+        """w_a_lo_t: this rank's first column of decode's w_a shard (_w_a_sharded), a buffer (vocab_start_t's rule)."""
+        self.register_buffer("w_a_lo_t", torch.tensor(self.w_a_lo, dtype=torch.int64, device="cpu").to(device),
+                             persistent=False)
 
     load_attention = staticmethod(load_attention)
 
