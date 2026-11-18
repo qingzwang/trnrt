@@ -45,12 +45,15 @@ GLM-5.3 (`zai-org/GLM-5.3`, `GlmMoeDsaForCausalLM`) loads, prefills and decodes 
 transformers 5.17.0 on CPU (`tests/test_glm_moe_dsa.py`) and on the real checkpoint's first 4 layers (fp32, CPU). The
 full model runs on one trn2.48xlarge as one engine of 64 ranks, from a cache built by `trnrt compile`.
 
-Measured once each (no repeats), 2026-11-17 and 2026-11-18: trn2.48xlarge, the image of `docker/Dockerfile` (Neuron SDK 2.32,
-neuronx-cc 2.27), `zai-org/GLM-5.3` at ba32f8c19c8738e2c57c71798c601d477a7bf844, bf16 activations with the checkpoint's
-FP8 weights, a bf16 KV cache, `--tp 64 --moe-kernel nki --moe-ep 2 --page-size 32 --max-num-seqs 4 --max-model-len 4096
---decode-buckets 1,4 --prefill-buckets 512 --page-buckets 16,128`, no speculation. Decode is the steady-state step (the
-difference of a 72- and an 8-token greedy generation over 64-token prompts, so prefill cancels out); prefill is one
-2,000-token prompt that hits nothing in the prefix cache. Correctness was checked by reading two greedy chat answers.
+Measured once each (no repeats), 2026-11-17 and 2026-11-18: trn2.48xlarge, the image of `docker/Dockerfile` (Neuron SDK
+2.32, neuronx-cc 2.27), `zai-org/GLM-5.3` at ba32f8c19c8738e2c57c71798c601d477a7bf844, bf16 activations with the
+checkpoint's FP8 weights, a bf16 KV cache, `--tp 64 --moe-kernel nki --moe-ep 2 --page-size 32 --max-num-seqs 4
+--max-model-len 4096 --decode-buckets 1,4 --prefill-buckets 512 --page-buckets 16,128`, no speculation. Decode is the
+steady-state step (the difference of a 72- and an 8-token greedy generation over 64-token prompts, so prefill cancels
+out); prefill is one 2,000-token prompt that hits nothing in the prefix cache. Correctness was checked by reading two
+greedy chat answers. The attention front kernel changes decode's roundings (its norms sum in another order), so its
+greedy text leaves the previous row's at near-ties: forced along the previous build's tokens (3 prompts, 24 decode
+steps), its top-1 agreed at every step, with chosen-token logprobs 0.018 apart on average (at most 0.27).
 
 | Configuration | Decode, batch 1 | Decode, batch 4 | Prefill, 2,000 tokens |
 |---|---|---|---|
@@ -60,12 +63,13 @@ difference of a 72- and an 8-token greedy generation over 64-token prompts, so p
 | + its weight loads on two DMA queues, the one-head MLA decode kernel (`kernels/mla_decode.py`) | 31.0 ms/step | 44.4 ms/step | 3.04 s |
 | + decode's q_a / kv_a projection as tp column shards, no indexer query below index_topk keys | 29.3 ms/step | 42.9 ms/step | 3.04 s |
 | + the decode MoE block (router, top 8, experts, shared expert) as one kernel (`kernels/glm_moe_half.py`) | 24.4 ms/step | 36.9 ms/step | 3.03 s |
+| + the decode attention front (norm, q_a / kv_a shard and its all-reduce, q_b, RoPE, indexer key) as one kernel (`kernels/glm_attn_front.py`) | 19.2 ms/step | 28.0 ms/step | 3.03 s |
 
 | Missing | Why it matters |
 |---|---|
 | Decode megakernels and context-parallel DSA | Flash's fused layer kernels assume NoPE MLA with a pooled indexer. GLM-5.3's attention is XLA: each rank holds every sequence's whole latent and attends over the whole context with a mask. |
 | FP8 decode weights | The decode kernels read bf16 copies made at load (+1.5 GB a rank). GLM-5.3's FP8 block scales are not powers of two, so the copies cannot be FP8 without a second rounding of every weight. |
-| Collectives and glue between kernels | A decode step is a few hundred kernel calls with XLA ops and 236 all-reduces between them (2 a layer, plus decode's sharded q_a / kv_a). The MoE block is one kernel; the attention block is still several kernels and XLA ops, its all-reduces outside them. |
+| Collectives and glue between kernels | A decode step is a few hundred kernel calls with XLA ops and 236 all-reduces between them (2 a layer, plus decode's sharded q_a / kv_a). The MoE block and the attention front are one kernel each; the attention itself (cache rows, the selection above index_topk keys, MLA, o_proj) is still several kernels and XLA ops, and the block outputs' all-reduces are XLA's. |
 | Sequence-parallel prefill streams | Off for GLM-5.3: every rank runs every row of a chunk. |
 | MTP speculative decoding | Its MTP layer (`model.layers.78`) is not built, and the engine refuses `--spec-method` for it. |
 | FP8 KV precision | The FP8 cache rounds the rope key and the indexer key to e4m3 (scale 1). On a random tiny model that changes greedy output from the first token on. Not measured on the real weights. |

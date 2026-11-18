@@ -286,17 +286,26 @@ def _indexer(model, layer, x, q_resid, cs, dec: bool = False, scores: bool = Tru
     weights are None, and their weights (16.8 MB of wq_b a full layer at GLM-5.3's shapes) are not read."""
     m = layer.spec.mla
     d = m.dsa
-    T, dr = x.shape[0], m.qk_rope_head_dim
+    dr = m.qk_rope_head_dim
     cos, sin = cs
     k = _lin(model, layer, x, "idx_wk", dec)
     k = F.layer_norm(k.float(), (d.head_dim,), layer.idx_knorm_w.float(), layer.idx_knorm_b.float(), 1e-6).to(x.dtype)
     k = torch.cat([rope(k[..., :dr], cos, sin), k[..., dr:]], dim=-1)
     if not scores:
         return None, k, None
+    q, w = _indexer_query(model, layer, x, q_resid, cs, dec)
+    return q, k, w
+
+
+def _indexer_query(model, layer, x, q_resid, cs, dec: bool):
+    """The indexer's rotated query [T, Hi, Di] and head weights [T, Hi] fp32 (_indexer's)."""
+    d = layer.spec.mla.dsa
+    T, dr = x.shape[0], layer.spec.mla.qk_rope_head_dim
+    cos, sin = cs
     q = _lin(model, layer, q_resid, "idx_wq", dec).view(T, d.n_heads, d.head_dim)
     q = torch.cat([rope(q[..., :dr], cos.unsqueeze(1), sin.unsqueeze(1)), q[..., dr:]], dim=-1)
     w = _lin(model, layer, x, "idx_wproj", dec) * d.n_heads ** -0.5
-    return q, k, w
+    return q, w
 
 
 # The device's top-k of a full layer's selection: "nki" is kernels/dsa_topk.py (its emulation on the host, the tie rule
@@ -379,23 +388,32 @@ def _attend(model, layer, q_nope, q_pe, kc, vis, B: int, Q: int, absorb: bool) -
     return o.reshape(B * Q, nh * dv)
 
 
-def attention(model, layer, x, positions, slot_mapping, table, bias):
+def attention(model, layer, x, positions, slot_mapping, table, bias, front=None):
     """The attention block over the paged cache, for a decode batch (table [B, P], positions [B]), a prefill chunk
     (table [P], positions [C]) or a verify batch (table [B, P], bias [B, 1, 1, Q, L]); x is already normalised.
-    Writes the token's cache rows first, then attends (selecting in a bucket of more than index_topk keys). Returns
-    the o_proj output before the tensor-parallel all-reduce."""
+    Writes the token's cache rows first, then attends (selecting in a bucket of more than index_topk keys). front:
+    kernels/glm_attn_front.py's outputs (q_nope, q_pe, the cache row, the indexer key, q_resid) in place of the
+    projections (x then only feeds the indexer's head weights, None below index_topk keys). Returns the o_proj output
+    before the tensor-parallel all-reduce."""
     m = layer.spec.mla
     d = m.dsa
-    T = x.shape[0]
+    T = positions.reshape(-1).shape[0]
     dec = table.dim() == 2  # a decode or verify batch: the whole-step graph, with decode's weight copies
-    q_nope, q_pe, c, k_pe, q_resid, cs = _project(model, layer, x, positions, dec)
-    model._store(layer.k_cache, slot_mapping, torch.cat([c, k_pe], dim=-1).unsqueeze(1))
-    idx = None
     L = table.shape[-1] * model.page_size  # the bucket's keys (static)
-    if not m.index_shared:
-        qi, ki, wi = _indexer(model, layer, x, q_resid, cs, dec, scores=L > d.topk)
-        model._store(layer.v_cache, slot_mapping, ki.unsqueeze(1))
-        idx = (qi, wi)
+    idx = None
+    if front is not None:
+        q_nope, q_pe, row, ki, q_resid = front
+        model._store(layer.k_cache, slot_mapping, row.unsqueeze(1))
+        if not m.index_shared:
+            model._store(layer.v_cache, slot_mapping, ki.unsqueeze(1))
+            idx = _indexer_query(model, layer, x, q_resid, model._rope(positions), dec) if L > d.topk else (None, None)
+    else:
+        q_nope, q_pe, c, k_pe, q_resid, cs = _project(model, layer, x, positions, dec)
+        model._store(layer.k_cache, slot_mapping, torch.cat([c, k_pe], dim=-1).unsqueeze(1))
+        if not m.index_shared:
+            qi, ki, wi = _indexer(model, layer, x, q_resid, cs, dec, scores=L > d.topk)
+            model._store(layer.v_cache, slot_mapping, ki.unsqueeze(1))
+            idx = (qi, wi)
     kc = model._load(layer.k_cache, table).squeeze(-2)  # [(B,) L, r + dr]
     if table.dim() == 1:  # chunk: one sequence, C queries
         B, Q = 1, T
@@ -412,7 +430,7 @@ def attention(model, layer, x, positions, slot_mapping, table, bias):
     from ..kernels import mla_decode
 
     dk = getattr(layer, "dk_w_uk", None)
-    if (dk is not None and bias.dim() == 4 and x.device.type != "cpu"
+    if (dk is not None and bias.dim() == 4 and q_nope.device.type != "cpu"
             and mla_decode.takes(B, L, m.qk_nope_head_dim, m.qk_rope_head_dim, m.kv_lora_rank)):
         # a decode batch on the device, one head a rank: kernels/mla_decode.py over the context's rows
         out = mla_decode.attend(q_nope.reshape(B, -1), q_pe.reshape(B, -1), kc, vis.reshape(B, L), dk,
@@ -687,9 +705,14 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
             self._w_a_buffer(device)
 
     def _w_a_buffer(self, device) -> None:
-        """w_a_lo_t: this rank's first column of decode's w_a shard (_w_a_sharded), a buffer (vocab_start_t's rule)."""
+        """w_a_lo_t: this rank's first column of decode's w_a shard (_w_a_sharded), and w_a_place [n, W] bf16 its
+        columns' one-hot placement in the latent row (kernels/glm_attn_front.py), buffers (vocab_start_t's rule)."""
         self.register_buffer("w_a_lo_t", torch.tensor(self.w_a_lo, dtype=torch.int64, device="cpu").to(device),
                              persistent=False)
+        layer = next(l for l in self.layers if getattr(l, "dt_w_a_shard", None) is not None)
+        n, W = layer.dt_w_a_shard.shape[2], layer.w_a_cols
+        place = (torch.arange(W).view(1, W) == torch.arange(n).view(n, 1) + self.w_a_lo).to(torch.bfloat16)
+        self.register_buffer("w_a_place", place.to(device), persistent=False)
 
     load_attention = staticmethod(load_attention)
 
@@ -710,9 +733,21 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
         """GlmMoeDsaDecoderLayer.forward: attention, then the MLP, each on a pre-norm residual."""
         if mixin:
             raise ValueError(f"hybrid.layer's {sorted(mixin)} reached a GLM-5.3 layer")
+        from ..kernels import glm_attn_front
+
         eps = self.cfg.rms_norm_eps
-        x = rms_norm(h, layer.in_norm, eps)
-        h = h + self._attn_all_reduce(attention(self, layer, x, positions, slot_mapping, table, bias))
+        dec = table.dim() == 2
+        if (dec and bias.dim() == 4 and (h.device.type != "cpu" or glm_attn_front.host())
+                and glm_attn_front.takes(self, layer, h.shape[0])):
+            # a decode batch: the attention front as one kernel (norm, projections, the w_a shard's all-reduce, RoPE)
+            m = layer.spec.mla
+            scores = not m.index_shared and table.shape[-1] * self.page_size > m.dsa.topk
+            fr = glm_attn_front.front(self, layer, h, positions, qres=scores)
+            x = rms_norm(h, layer.in_norm, eps) if scores else None
+            a = attention(self, layer, x, positions, slot_mapping, table, bias, front=fr)
+        else:
+            a = attention(self, layer, rms_norm(h, layer.in_norm, eps), positions, slot_mapping, table, bias)
+        h = h + self._attn_all_reduce(a)
         return h + mlp(self, layer, rms_norm(h, layer.post_norm, eps), dec=table.dim() == 2)
 
     def _run_layers(self, h, positions, slot_mapping, attn, state_slot=None):
