@@ -341,7 +341,7 @@ class DecoderForCausalLM(nn.Module):
             H = cfg.hidden_size
             self.mtp = DecoderLayer(cfg, cfg.mtp_spec, dtype, tp_size, tp_rank, moe=cfg.mtp_moe, keep_fp8=keep_fp8,
                                     prefix=cfg.mtp_prefix, moe_kernel=moe_kernel, attn_tp=self.attn_tp,
-                                    attn_rank=self.attn_rank, plain=cfg.hybrid is not None)
+                                    attn_rank=self.attn_rank, plain=True)
             self.mtp_enorm, self.mtp_hnorm, self.mtp_norm = (
                 nn.Parameter(torch.empty(H, dtype=dtype), requires_grad=False) for _ in range(3))
             self.mtp_eh = nn.Parameter(torch.empty(H, 2 * H, dtype=dtype), requires_grad=False)

@@ -70,3 +70,37 @@ def test_kernel_in_the_simulator_is_its_emulation(grid, B, L, masked):
     ).float()
     want = md.emulate(qn, qp, kc, bias, w_uk, w_uv_t, 256**-0.5).float()
     assert (got - want).abs().max().item() <= 2e-2 * want.abs().max().item()
+
+
+@needs_nki
+@pytest.mark.parametrize("grid", [1, 2])
+def test_a_verify_batch_attends_its_sequences_rows(grid):
+    """rep: a verify batch of 2 sequences x 3 positions, each position its own visibility, over its sequence's rows
+    (kc [2, L, W]); and the positive control: the same rows over the wrong sequences' rows differ."""
+    import nki
+
+    B, Q, L = 2, 3, 256
+    qn, qp, _, bias, w_uk, w_uv = case(B * Q, L, masked=20)
+    kc = case(B, L, seed=1)[2]
+    for j in range(B * Q):  # position j of a sequence sees one key more than position j - 1
+        bias[j, L - 40 + j % Q :] = md.NEG_INF
+    w_uv_t = w_uv.t().contiguous()
+    kern = md.mla_decode_kernel[grid] if grid > 1 else md.mla_decode_kernel
+    got = torch.as_tensor(
+        nki.simulate(kern)(
+            q_nope=qn,
+            q_pe=qp,
+            kc=kc,
+            bias=bias,
+            w_uk=w_uk,
+            w_uv_t=w_uv_t,
+            ident=torch.eye(128, dtype=torch.bfloat16),
+            scale=256**-0.5,
+            rev=md.REV,
+            rep=Q,
+        )
+    ).float()
+    want = md.emulate(qn, qp, kc, bias, w_uk, w_uv_t, 256**-0.5, rep=Q).float()
+    assert (got - want).abs().max().item() <= 2e-2 * want.abs().max().item()
+    wrong = md.emulate(qn, qp, kc.flip(0), bias, w_uk, w_uv_t, 256**-0.5, rep=Q).float()
+    assert (got - wrong).abs().max().item() > 2e-2 * want.abs().max().item()

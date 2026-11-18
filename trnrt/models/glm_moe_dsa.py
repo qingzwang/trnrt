@@ -265,8 +265,10 @@ def _project(model, layer, x, positions, dec: bool = False):
     m = layer.spec.mla
     T = x.shape[0]
     dn, dr, r, ql = m.qk_nope_head_dim, m.qk_rope_head_dim, m.kv_lora_rank, m.q_lora_rank
-    if dec and getattr(layer, "dt_w_a_shard", None) is not None:
-        a = _w_a_sharded(model, layer, x)
+    from ..kernels import gemv_tiled
+
+    if dec and getattr(layer, "dt_w_a_shard", None) is not None and gemv_tiled.takes(T):
+        a = _w_a_sharded(model, layer, x)  # (an MTP pass over a prefill chunk's rows is a decode call past the kernel's)
     else:
         a = _lin(model, layer, x, "w_a", dec)
     q_resid = rms_norm(a[:, :ql], layer.q_a_norm, m.norm_eps)
@@ -430,11 +432,12 @@ def attention(model, layer, x, positions, slot_mapping, table, bias, front=None)
     from ..kernels import mla_decode
 
     dk = getattr(layer, "dk_w_uk", None)
-    if (dk is not None and bias.dim() == 4 and q_nope.device.type != "cpu"
-            and mla_decode.takes(B, L, m.qk_nope_head_dim, m.qk_rope_head_dim, m.kv_lora_rank)):
-        # a decode batch on the device, one head a rank: kernels/mla_decode.py over the context's rows
-        out = mla_decode.attend(q_nope.reshape(B, -1), q_pe.reshape(B, -1), kc, vis.reshape(B, L), dk,
-                                layer.dk_w_uv_t, m.softmax_scale)
+    if (dk is not None and table.dim() == 2 and q_nope.device.type != "cpu"
+            and mla_decode.takes(B * Q, L, m.qk_nope_head_dim, m.qk_rope_head_dim, m.kv_lora_rank)):
+        # a decode or verify batch on the device, one head a rank: kernels/mla_decode.py over the context's rows (a
+        # verify batch's Q rows of a sequence over that sequence's rows)
+        out = mla_decode.attend(q_nope.reshape(B * Q, -1), q_pe.reshape(B * Q, -1), kc, vis.reshape(B * Q, L), dk,
+                                layer.dk_w_uv_t, m.softmax_scale, rep=Q)
     else:
         out = _attend(model, layer, q_nope, q_pe, kc, vis, B, Q, absorb=table.dim() != 1)
     return _lin(model, layer, out, "o", dec)
@@ -540,8 +543,6 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
     def __init__(self, cfg: ModelConfig, dtype: torch.dtype, max_positions: int, tp_rank: int = 0, tp_size: int = 1,
                  tp_group=None, keep_fp8: bool = False, vocab_parallel: bool = False, moe_kernel: str = "xla",
                  attn_tp: int | None = None, attn_group=None, mtp: bool = False):
-        if mtp:
-            raise NotImplementedError("GLM-5.3's MTP layer (speculative decoding) is not supported yet")
         if cfg.hybrid is not None:
             raise ValueError("GLM-5.3 has no hyper-connection streams")
         ep = MOE_EP if cfg.num_experts else 1
@@ -549,7 +550,7 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
         # moe_kernel would refuse tp's width (moe_dedupe.supports) before then.
         super().__init__(cfg, dtype, max_positions, tp_rank, tp_size, tp_group, keep_fp8=keep_fp8,
                          vocab_parallel=vocab_parallel, moe_kernel="xla" if ep > 1 else moe_kernel, attn_tp=attn_tp,
-                         attn_group=attn_group)
+                         attn_group=attn_group, mtp=mtp)
         self.moe_ep = ep
         if ep > 1:
             self._init_ep(moe_kernel)
@@ -560,10 +561,12 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
             self._buffers.pop(name, None)
         for i, layer in enumerate(self.layers):
             _fix_indexer(self, layer, f"model.layers.{i}")
+        if self.mtp is not None:  # the MTP layer (model.layers.78): a full DSA layer with its own indexer, and the MoE
+            _fix_indexer(self, self.mtp, cfg.mtp_prefix)
         self.rope_positions = max_positions
         self._sel = None  # the selection a full layer published for the shared layers of the same graph (_selection)
         self._rope_buffer(None)
-        for layer in self.layers:
+        for layer in self.kv_layers():
             self._init_decode_copies(layer)
         shard = next((l.dt_w_a_shard for l in self.layers if getattr(l, "dt_w_a_shard", None) is not None), None)
         self.w_a_lo = self.tp_rank * shard.shape[2] if shard is not None else None
@@ -656,11 +659,16 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
         El, Im = E // ep, I // sub
         self.moe_inter = Im
         self.ep_lo = group * El
-        for i, layer in enumerate(self.layers):
+        prefixes = [f"model.layers.{i}" for i in range(len(self.layers))]
+        layers = list(self.layers)
+        if self.mtp is not None:
+            prefixes.append(cfg.mtp_prefix)
+            layers.append(self.mtp)
+        for i, (layer, prefix) in enumerate(zip(layers, prefixes)):
             if not layer.moe:
                 continue
             ref = layer.router
-            quant = self.keep_fp8 and cfg.is_quantized(f"model.layers.{i}.mlp.experts", True)
+            quant = self.keep_fp8 and cfg.is_quantized(f"{prefix}.mlp.experts", True)
             bk = cfg.quant_expert_block
 
             def param(*shape, dt):
@@ -737,9 +745,10 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
 
         eps = self.cfg.rms_norm_eps
         dec = table.dim() == 2
-        if (dec and bias.dim() == 4 and (h.device.type != "cpu" or glm_attn_front.host())
+        if (dec and (h.device.type != "cpu" or glm_attn_front.host())
                 and glm_attn_front.takes(self, layer, h.shape[0])):
-            # a decode batch: the attention front as one kernel (norm, projections, the w_a shard's all-reduce, RoPE)
+            # a decode or verify batch: the attention front as one kernel (norm, projections, the w_a shard's
+            # all-reduce, RoPE), row by row
             m = layer.spec.mla
             scores = not m.index_shared and table.shape[-1] * self.page_size > m.dsa.topk
             fr = glm_attn_front.front(self, layer, h, positions, qres=scores)

@@ -1054,6 +1054,8 @@ class ModelRunner:
             valid[b] = 1.0
             npg = min(len(r.pages), P)
             table[b, :npg] = r.pages[:npg]
+            if self.state is None:  # no recurrent state (GLM-5.3): the rows are unused
+                continue
             rs = self.state.rows_of(r)
             if len(rs) < Q:
                 raise RuntimeError(f"verify of {Q} positions needs {Q} state rows per request, not {len(rs)}")
@@ -1074,7 +1076,7 @@ class ModelRunner:
             for b, s in cold:
                 tok[b] = s.req.token_ids[s.start]
                 base[b] = s.start
-                cur[b] = self.state.row(s.req)
+                cur[b] = self.state.row(s.req) if self.state is not None else 0
                 v[b] = 1.0
                 s.req.spec_ready = True
             self._exec("spec_host_init", ("spec_host_init", B), [SPEC, slot_idx, tok, base, cur, v])
@@ -1129,7 +1131,7 @@ class ModelRunner:
             slot_idx[0] = self.slot(x.req)
             valid[0] = 1.0
             base[0] = x.end
-            cur[0] = self.state.row(x.req)
+            cur[0] = self.state.row(x.req) if self.state is not None else 0
             self._exec("spec_init", ("spec_init", 1), [SPEC, BOARD, slot_idx, base, cur, valid])
             x.req.spec_ready = True
         # The MTP pass over the chunk: positions start .. end - 1 take the token after them (prompt tokens, the last the

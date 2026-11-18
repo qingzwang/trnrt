@@ -64,6 +64,7 @@ steps), its top-1 agreed at every step, with chosen-token logprobs 0.018 apart o
 | + decode's q_a / kv_a projection as tp column shards, no indexer query below index_topk keys | 29.3 ms/step | 42.9 ms/step | 3.04 s |
 | + the decode MoE block (router, top 8, experts, shared expert) as one kernel (`kernels/glm_moe_half.py`) | 24.4 ms/step | 36.9 ms/step | 3.03 s |
 | + the decode attention front (norm, q_a / kv_a shard and its all-reduce, q_b, RoPE, indexer key) as one kernel (`kernels/glm_attn_front.py`) | 19.2 ms/step | 28.0 ms/step | 3.03 s |
+| + MTP speculative decoding, 2 drafts a step (`--spec-method mtp --spec-k 2`): mean acceptance length 2.58 (batch 1) and 2.72 (batch 4) | 16.9 ms a token (59.3 tok/s) | 16.8 ms a token a sequence (238.2 tok/s) | 3.16 s |
 
 | Missing | Why it matters |
 |---|---|
@@ -71,7 +72,7 @@ steps), its top-1 agreed at every step, with chosen-token logprobs 0.018 apart o
 | FP8 decode weights | The decode kernels read bf16 copies made at load (+1.5 GB a rank). GLM-5.3's FP8 block scales are not powers of two, so the copies cannot be FP8 without a second rounding of every weight. |
 | Collectives and glue between kernels | A decode step is a few hundred kernel calls with XLA ops and 236 all-reduces between them (2 a layer, plus decode's sharded q_a / kv_a). The MoE block and the attention front are one kernel each; the attention itself (cache rows, the selection above index_topk keys, MLA, o_proj) is still several kernels and XLA ops, and the block outputs' all-reduces are XLA's. A back kernel (MLA, o_proj, the all-reduce inside the kernel, the residual and the post-attention norm in one call) measured slower, 19.6 / 29.6 ms/step at batch 1 / 4, so it is not used. Its first form, with program 1 writing half of the all-reduce's send buffer, decoded garbage on trn2 although the simulator computed it right. |
 | Sequence-parallel prefill streams | Off for GLM-5.3: every rank runs every row of a chunk. |
-| MTP speculative decoding | Its MTP layer (`model.layers.78`) is not built, and the engine refuses `--spec-method` for it. |
+| MTP tuning | A verify step (3 rows a sequence, then the MTP layer's draft passes) costs about 2.3 plain decode steps at batch 1, so MTP gains 14% there and 67% at batch 4. The checkpoint's `index_share_for_mtp_iteration` is not used: each draft pass runs the MTP layer's own indexer, which changes drafts, never the verified tokens. |
 | FP8 KV precision | The FP8 cache rounds the rope key and the indexer key to e4m3 (scale 1). On a random tiny model that changes greedy output from the first token on. Not measured on the real weights. |
 | Long contexts | Measured at up to 4,096 tokens only. |
 

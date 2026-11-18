@@ -304,8 +304,6 @@ class LLMEngine:
         self.scheduler = Scheduler(scfg, self.pool, self.radix, draft_fn=self._propose if cfg.spec_method else None)
         state = self.runner.state
         if state is None:
-            if cfg.spec_method:
-                raise ValueError("speculative decoding of a model without recurrent state is not supported yet")
             self.scheduler.stateless = self.radix.stateless = True
         else:
             self.scheduler.states = state  # checkpoint rows of the state pool back the radix nodes

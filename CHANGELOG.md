@@ -18,6 +18,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - `kernels/mla_decode.py`: GLM-5.3's absorbed-MLA decode attention for one head per rank, as one kernel.
 - `kernels/glm_moe_half.py`: GLM-5.3's decode MoE block (router, top 8, routed experts under expert parallelism, shared
   expert) as one kernel, from `kernels/moe_half.py`'s.
+- MTP speculative decoding for GLM-5.3 (`--spec-method mtp`): its MTP layer (`model.layers.78`) is built and loaded, the
+  engine speculates on a model without recurrent state, and verify batches take the decode kernels (`kernels/mla_decode.py`
+  `rep`: a sequence's positions over its own cache rows).
 - `kernels/glm_attn_front.py`: GLM-5.3's decode attention front (the input norm, decode's q_a / kv_a column shard with
   its all-reduce inside the kernel, the latent norms, q_b, RoPE and the indexer key) as one kernel.
 - The engine serves models without recurrent state: a prefix hit resumes from any cached page, with no state

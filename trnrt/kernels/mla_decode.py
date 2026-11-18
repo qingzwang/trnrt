@@ -36,10 +36,12 @@ NEG_INF = -1e30
 
 
 def emulate(q_nope: torch.Tensor, q_pe: torch.Tensor, kc: torch.Tensor, bias: torch.Tensor, w_uk: torch.Tensor,
-            w_uv_t: torch.Tensor, scale: float) -> torch.Tensor:
-    """The kernel's arithmetic: q_nope [B, dn], q_pe [B, dr], kc [B, L, r + dr] ([c | k_pe]), bias [B, L] fp32, w_uk
-    [dn, r], w_uv_t [r, dv] (all bf16) -> [B, dv] bf16."""
+            w_uv_t: torch.Tensor, scale: float, rep: int = 1) -> torch.Tensor:
+    """The kernel's arithmetic: q_nope [B, dn], q_pe [B, dr], kc [B / rep, L, r + dr] ([c | k_pe]; row b attends
+    sequence b // rep), bias [B, L] fp32, w_uk [dn, r], w_uv_t [r, dv] (all bf16) -> [B, dv] bf16."""
     bf = torch.bfloat16
+    if rep > 1:
+        kc = kc.repeat_interleave(rep, dim=0)
     r = w_uk.shape[1]
     q_lat = (torch.einsum("bd,dr->br", q_nope.float(), w_uk.float()) * scale).to(bf)
     q = torch.cat([q_lat, (q_pe.float() * scale).to(bf)], dim=-1).float()
@@ -60,10 +62,11 @@ except ImportError:
 # -- the kernel (its span is what REV hashes)
 if nki is not None:
     @nki.jit
-    def mla_decode_kernel(q_nope, q_pe, kc, bias, w_uk, w_uv_t, ident, scale: float, rev: int):
-        """emulate()'s attention, rows split over the LNC programs. q_nope [B, dn], q_pe [B, dr], kc [B, L, r + dr],
-        bias [B, L] fp32, w_uk [dn, r], w_uv_t [r, dv], ident [128, 128] (all bf16 but bias); L a multiple of 128,
-        r a multiple of 128, dn and dr at most 2 x 128 and 128. Returns bf16 [B, dv]."""
+    def mla_decode_kernel(q_nope, q_pe, kc, bias, w_uk, w_uv_t, ident, scale: float, rev: int, rep: int = 1):
+        """emulate()'s attention, rows split over the LNC programs. q_nope [B, dn], q_pe [B, dr], kc [B / rep, L, r +
+        dr] (row b attends sequence b // rep's rows: a verify batch's rep positions a sequence), bias [B, L] fp32,
+        w_uk [dn, r], w_uv_t [r, dv], ident [128, 128] (all bf16 but bias); L a multiple of 128, r a multiple of 128,
+        dn and dr at most 2 x 128 and 128. Returns bf16 [B, dv]."""
         f32, bf16 = nl.float32, nl.bfloat16
         B, dn = q_nope.shape
         dr = q_pe.shape[1]
@@ -110,7 +113,7 @@ if nki is not None:
                 KT = []
                 for i in range(NT):
                     kt = nl.ndarray((P, W), dtype=bf16, buffer=nl.sbuf)
-                    nisa.dma_copy(dst=kt, src=kc.ap(pattern=[[W, P], [1, W]], offset=(b * L + i * P) * W))
+                    nisa.dma_copy(dst=kt, src=kc.ap(pattern=[[W, P], [1, W]], offset=((b // rep) * L + i * P) * W))
                     KT.append(kt)
                     # K^T [W, 128] in RB + 1 blocks of dims, then the tile's scores [1, 128]
                     kts = []
@@ -185,12 +188,12 @@ def takes(B: int, L: int, dn: int, dr: int, r: int) -> bool:
     return 0 < B <= 128 and L % P == 0 and 0 < L // P <= 32 and r % P == 0 and dn <= 2 * P and 0 < dr <= P
 
 
-def attend(q_nope, q_pe, kc, bias, w_uk, w_uv_t, scale: float) -> torch.Tensor:
+def attend(q_nope, q_pe, kc, bias, w_uk, w_uv_t, scale: float, rep: int = 1) -> torch.Tensor:
     """The kernel at the runtime's grid on a Neuron device (or under shell.HOST_SIM), emulate() on the host."""
     from . import shell as SH
 
     if q_nope.device.type == "cpu" and not SH.HOST_SIM:
-        return emulate(q_nope, q_pe, kc, bias, w_uk, w_uv_t, scale)
+        return emulate(q_nope, q_pe, kc, bias, w_uk, w_uv_t, scale, rep)
     if mla_decode_kernel is None:
         raise RuntimeError("the NKI MLA decode kernel needs the nki package (the Neuron venv)")
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
@@ -201,4 +204,5 @@ def attend(q_nope, q_pe, kc, bias, w_uk, w_uv_t, scale: float) -> torch.Tensor:
     ident = torch.eye(P, dtype=bf, device=q_nope.device)
     return wrap_nki(mla_decode_kernel)[platform.nki_grid()](
         q_nope=q_nope.to(bf).contiguous(), q_pe=q_pe.to(bf).contiguous(), kc=kc.to(bf).contiguous(),
-        bias=bias.float().contiguous(), w_uk=w_uk, w_uv_t=w_uv_t, ident=ident, scale=float(scale), rev=REV)
+        bias=bias.float().contiguous(), w_uk=w_uk, w_uv_t=w_uv_t, ident=ident, scale=float(scale), rev=REV,
+        rep=int(rep))
