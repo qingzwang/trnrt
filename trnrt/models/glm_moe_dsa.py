@@ -325,6 +325,11 @@ DEVICE_TOPK = "nki"
 # of moe_dedupe's plan, adding 0), and the one all-reduce after the MLP sums the groups as it sums the column shards.
 MOE_EP = 1
 
+# Decode context parallelism (EngineConfig.dcp, set on every rank by engine.set_decode_routes before the shard is built):
+# each group of DCP consecutive attention ranks holds 1 / DCP of every sequence's cache rows (models/glm_dcp.py). 1: off,
+# every rank holds every row.
+DCP = 1
+
 
 def _xla_selection(index: torch.Tensor, vis: torch.Tensor, keep: int) -> torch.Tensor:
     """Additive [B, Q, L]: 0 at each query's `keep` best-scored visible keys (all visible ones if fewer), else NEG_INF."""
@@ -397,6 +402,10 @@ def attention(model, layer, x, positions, slot_mapping, table, bias, front=None)
     kernels/glm_attn_front.py's outputs (q_nope, q_pe, the cache row, the indexer key, q_resid) in place of the
     projections (x then only feeds the indexer's head weights, None below index_topk keys). Returns the o_proj output
     before the tensor-parallel all-reduce."""
+    from . import glm_dcp
+
+    if glm_dcp.enabled(model):
+        return _attention_dcp(model, layer, x, positions, slot_mapping, table, bias, front)
     m = layer.spec.mla
     d = m.dsa
     T = positions.reshape(-1).shape[0]
@@ -441,6 +450,92 @@ def attention(model, layer, x, positions, slot_mapping, table, bias, front=None)
     else:
         out = _attend(model, layer, q_nope, q_pe, kc, vis, B, Q, absorb=table.dim() != 1)
     return _lin(model, layer, out, "o", dec)
+
+
+def _attention_dcp(model, layer, x, positions, slot_mapping, table, bias, front=None):
+    """attention() under decode context parallelism (models/glm_dcp.py): the same projections and cache rows, written by
+    their owning rank, then the selection and the attention over the group's local rows. Returns the o_proj output
+    before the tensor-parallel all-reduce."""
+    from . import glm_dcp
+
+    m = layer.spec.mla
+    d = m.dsa
+    T = positions.reshape(-1).shape[0]
+    dec = table.dim() == 2
+    full = not m.index_shared
+    if front is not None:
+        q_nope, q_pe, row, ki, q_resid = front
+        cs = model._rope(positions)
+    else:
+        q_nope, q_pe, c, k_pe, q_resid, cs = _project(model, layer, x, positions, dec)
+        row = torch.cat([c, k_pe], dim=-1)
+        ki = _indexer(model, layer, x, q_resid, cs, dec, scores=False)[1] if full else None
+    if table.dim() == 1:  # chunk: one sequence, C queries
+        B, Q, tab = 1, T, table.unsqueeze(0)
+    elif bias.dim() == 5:  # a verify batch: B sequences of Q rows
+        B, Q, tab = table.shape[0], bias.shape[3], table
+    else:  # decode
+        B, Q, tab = T, 1, table
+    pos = positions.reshape(-1)
+    slots = glm_dcp.local_slots(model, pos, tab.repeat_interleave(Q, dim=0), slot_mapping.reshape(-1))
+    model._store(layer.k_cache, slots, row.unsqueeze(1))
+    if full:
+        model._store(layer.v_cache, slots, ki.unsqueeze(1))
+    rows, kpos = glm_dcp.local_rows(model, tab)  # [B, Lloc], [Lloc]
+    kc = layer.k_cache[rows].squeeze(-2).to(model.dtype)  # [B, Lloc, r + dr] (model._load's cast)
+    model._dcp_lloc = rows.shape[1]
+    seen = kpos.view(1, 1, -1) <= pos.view(B, Q, 1).to(torch.float32)  # [B, Q, Lloc]
+    vis = glm_dcp.additive(seen)
+    L = tab.shape[-1] * model.page_size
+    if L > d.topk:
+        if full:
+            qi, wi = _indexer_query(model, layer, x, q_resid, cs, dec)
+            kI = layer.v_cache[rows].squeeze(-2).to(model.dtype).reshape(B, rows.shape[1], d.head_dim)
+            sc = pool_index(d, (None, qi.reshape(B, Q, d.n_heads, d.head_dim)), wi.view(B, Q, d.n_heads), kI)
+            sel = glm_dcp.select(model, sc, seen, kpos, d.topk)
+            model._dcp_sel = sel
+            _dcp_share(model, sel, T)
+        else:
+            sel = _dcp_shared(model, B, Q)
+    else:  # every visible key: the local rows themselves
+        idx = torch.arange(rows.shape[1], device=rows.device).view(1, 1, -1).expand(B, Q, rows.shape[1])
+        sel = (idx, vis)
+    out = glm_dcp.attend(model, layer, q_nope, q_pe, kc, sel[0], sel[1], B, Q)
+    return _lin(model, layer, out, "o", dec)
+
+
+def _dcp_share(model, sel, T: int) -> None:
+    """A full layer's local candidates and mask into the DCP selection scratch (rows T), for shared layers in other
+    graphs."""
+    from .linear_attn import _write_rows
+
+    sidx, smask = getattr(model, "dcp_sel_idx", None), getattr(model, "dcp_sel_mask", None)
+    if sidx is None or T > sidx.shape[0]:
+        return
+    idx, mask = sel
+    m = idx.shape[-1]
+    rows = torch.arange(T, device=idx.device)
+    pad = sidx.shape[1] - m
+    vi = torch.cat([idx.reshape(T, m).to(sidx.dtype), torch.zeros(T, pad, dtype=sidx.dtype, device=idx.device)], 1)
+    vm = torch.cat([mask.reshape(T, m).to(smask.dtype), torch.full((T, pad), NEG_INF, dtype=smask.dtype,
+                                                                   device=idx.device)], 1)
+    _write_rows(sidx, rows, vi)
+    _write_rows(smask, rows, vm)
+
+
+def _dcp_shared(model, B: int, Q: int):
+    """A shared layer's selection under DCP: its full layer's, from the graph's carry or the scratch."""
+    sel = getattr(model, "_dcp_sel", None)
+    if sel is not None and tuple(sel[0].shape[:2]) == (B, Q):
+        return sel
+    sidx, smask = getattr(model, "dcp_sel_idx", None), getattr(model, "dcp_sel_mask", None)
+    if sidx is None or B * Q > sidx.shape[0]:
+        raise RuntimeError("a shared DSA layer has no DCP selection to reuse: its full layer ran in another graph and "
+                           "the selection scratch is missing or too small")
+    from . import glm_dcp
+
+    m = min(glm_dcp.m_local(), model._dcp_lloc)
+    return (sidx[: B * Q, :m].long().view(B, Q, m), smask[: B * Q, :m].float().view(B, Q, m))
 
 
 def reference(model, layer, x, positions):
@@ -554,6 +649,11 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
         self.moe_ep = ep
         if ep > 1:
             self._init_ep(moe_kernel)
+        if DCP > 1:  # decode context parallelism (models/glm_dcp.py) in row groups of DCP attention ranks
+            if self.attn_tp % DCP:
+                raise ValueError(f"dcp {DCP} must divide the attention TP {self.attn_tp}")
+            self.cp, self.cp_rows = DCP, self.attn_tp // DCP
+            self._dcp_sel = None
         # Sequence-parallel prefill streams and context-parallel DSA are GLM-5.3-Flash's paths (models/hybrid.py,
         # models/mla.py attention_cp); every rank here runs every row of a chunk over the replicated latent.
         self.prefill_sp = False
@@ -711,6 +811,10 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
             self._ep_buffer(device)
         if getattr(self, "w_a_lo", None) is not None:
             self._w_a_buffer(device)
+        if getattr(self, "cp", 1) > 1:
+            from . import glm_dcp
+
+            glm_dcp.rank_buffers(self, device)
 
     def _w_a_buffer(self, device) -> None:
         """w_a_lo_t: this rank's first column of decode's w_a shard (_w_a_sharded), and w_a_place [n, W] bf16 its
@@ -761,13 +865,36 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
 
     def _run_layers(self, h, positions, slot_mapping, attn, state_slot=None):
         bias, table = attn[None]
-        self._sel = None
+        self._sel = self._dcp_sel = None
         try:
             for layer in self.layers:
                 h = self._layer(layer, h, positions, slot_mapping, table, bias)
         finally:
-            self._sel = None
+            self._sel = self._dcp_sel = None
         return h
+
+    def bind_kv_cache(self, k_caches, v_caches, page_size: int, fp8_max: float | None = None, max_rows: int = 1,
+                      max_keys: int | None = None) -> None:
+        """DecoderForCausalLM.bind_kv_cache; under decode context parallelism (models/glm_dcp.py) the caches hold ps /
+        cp rows of each page, page_size must divide over cp, and the selection scratch is DCP's: rows x M_LOCAL local
+        candidates and their mask."""
+        cp = getattr(self, "cp", 1)
+        if cp == 1:
+            super().bind_kv_cache(k_caches, v_caches, page_size, fp8_max, max_rows, max_keys)
+            return
+        if page_size % cp:
+            raise ValueError(f"dcp {cp} must divide the page size {page_size}")
+        from . import glm_dcp
+
+        self.cp = 1  # the base's checks are context-parallel DSA's (GLM-5.3-Flash's pool keys)
+        try:
+            super().bind_kv_cache(k_caches, v_caches, page_size, fp8_max, max_rows, 1)
+        finally:
+            self.cp = cp
+        dev = k_caches[0].device if k_caches else None
+        rows = max(max_rows, 2)
+        self.dcp_sel_idx = torch.zeros(rows, glm_dcp.m_local(), dtype=torch.int32, device=dev)
+        self.dcp_sel_mask = torch.zeros(rows, glm_dcp.m_local(), dtype=torch.float32, device=dev)
 
     def group_fn(self, idxs):
         """DecoderForCausalLM.group_fn, with the selection carry cleared around each call: a graph's shared layers
@@ -776,11 +903,11 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
 
         @functools.wraps(f)
         def g(*args, **kw):
-            self._sel = None
+            self._sel = self._dcp_sel = None
             try:
                 return f(*args, **kw)
             finally:
-                self._sel = None
+                self._sel = self._dcp_sel = None
 
         return g
 

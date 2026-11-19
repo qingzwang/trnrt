@@ -18,6 +18,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
 - `kernels/mla_decode.py`: GLM-5.3's absorbed-MLA decode attention for one head per rank, as one kernel.
 - `kernels/glm_moe_half.py`: GLM-5.3's decode MoE block (router, top 8, routed experts under expert parallelism, shared
   expert) as one kernel, from `kernels/moe_half.py`'s.
+- Decode context parallelism for GLM-5.3 (`--dcp`, `models/glm_dcp.py`): each group of dcp attention ranks holds 1 / dcp of
+  every sequence's KV cache rows, the DSA selection merged exactly over the group (with a certificate), the attention's
+  partials combined by their softmax statistics.
 - MTP speculative decoding for GLM-5.3 (`--spec-method mtp`): its MTP layer (`model.layers.78`) is built and loaded, the
   engine speculates on a model without recurrent state, and verify batches take the decode kernels (`kernels/mla_decode.py`
   `rep`: a sequence's positions over its own cache rows).

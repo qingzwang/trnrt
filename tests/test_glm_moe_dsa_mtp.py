@@ -21,7 +21,7 @@ def build_mtp(path, seed=0):
     eh_proj and shared_head.norm are added; the config then counts LAYERS layers and one next-n layer."""
     from safetensors.torch import load_file, save_file
 
-    types = INDEXER_TYPES[:LAYERS] + ["full"]
+    types = [*INDEXER_TYPES[:LAYERS], "full"]
     build(path, seed=seed, layers=LAYERS + 1, indexer_types=types)
     f = os.path.join(path, "model.safetensors")
     sd = load_file(f)
@@ -31,15 +31,19 @@ def build_mtp(path, seed=0):
     sd[pre + "enorm.weight"] = (1 + 0.1 * torch.randn(H, generator=g)).to(sd["model.norm.weight"].dtype)
     sd[pre + "hnorm.weight"] = (1 + 0.1 * torch.randn(H, generator=g)).to(sd["model.norm.weight"].dtype)
     sd[pre + "shared_head.norm.weight"] = sd["model.norm.weight"].clone()
-    sd[pre + "eh_proj.weight"] = (torch.randn(H, 2 * H, generator=g) * (2 * H) ** -0.5).to(sd["model.norm.weight"].dtype)
+    sd[pre + "eh_proj.weight"] = (torch.randn(H, 2 * H, generator=g) * (2 * H) ** -0.5).to(
+        sd["model.norm.weight"].dtype
+    )
     save_file(sd, f, metadata={"format": "pt"})
-    c = json.load(open(os.path.join(path, "config.json")))
+    with open(os.path.join(path, "config.json")) as fh:
+        c = json.load(fh)
     c["num_hidden_layers"] = LAYERS
     c["num_nextn_predict_layers"] = 1
     for k, v in list(c.items()):  # every per-layer list (indexer_types, mlp_layer_types, layer_types) counts LAYERS
         if isinstance(v, list) and len(v) == LAYERS + 1:
             c[k] = v[:LAYERS]
-    json.dump(c, open(os.path.join(path, "config.json"), "w"))
+    with open(os.path.join(path, "config.json"), "w") as fh:
+        json.dump(c, fh)
 
 
 @pytest.fixture(scope="module")
@@ -49,9 +53,12 @@ def mtp_dir(tmp_path_factory):
     return path
 
 
-def test_the_mtp_layer_is_built_from_the_checkpoint(mtp_dir):
+def test_the_mtp_layer_is_built_from_the_checkpoint(mtp_dir, monkeypatch):
+    from trnrt.models import glm_moe_dsa
     from trnrt.models.config import ModelConfig
     from trnrt.models.loader import load_model
+
+    monkeypatch.setattr(glm_moe_dsa, "DCP", 1)
 
     cfg = ModelConfig.from_pretrained(mtp_dir)
     assert cfg.num_layers == LAYERS and cfg.mtp_layers == 1 and cfg.mtp_prefix == f"model.layers.{LAYERS}"

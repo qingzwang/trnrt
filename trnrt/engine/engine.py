@@ -63,11 +63,14 @@ def resolve_attention_tp(mcfg: ModelConfig, cfg: EngineConfig) -> int:
     return attention_tp(mcfg, cfg.tp, mtp=cfg.spec_method == "mtp")
 
 
-def _cp_degree(mcfg: ModelConfig, attn_tp: int) -> int:
-    """The context-parallel degree of the DSA caches (DecoderForCausalLM.cp): the attention TP when context-parallel
-    DSA is on and every attention layer can run the long path, else 1."""
+def _cp_degree(mcfg: ModelConfig, attn_tp: int, cfg: EngineConfig | None = None) -> int:
+    """The context-parallel degree of the DSA caches (DecoderForCausalLM.cp): GLM-5.3's dcp (models/glm_dcp.py); else
+    the attention TP when context-parallel DSA is on and every attention layer can run the long path, else 1."""
     from ..config import LinearSpec
-    from ..models import dsa_long, mla
+    from ..models import dsa_long, glm_moe_dsa, mla
+
+    if mcfg.architecture in glm_moe_dsa.ARCHITECTURES:
+        return int(cfg.dcp) if cfg is not None else 1
 
     specs = [s for s in (mcfg.attn_layers or ()) if not isinstance(s, LinearSpec)]
     ok = dsa_long.cp_enabled() and attn_tp > 1 and specs and all(mla.long_capable(s) for s in specs)
@@ -94,7 +97,7 @@ def pool_pages(cfg: EngineConfig, mcfg: ModelConfig) -> int:
         * cfg.page_size
     )
     # Context-parallel DSA (models/dsa_long.py): a rank holds 1 / cp of every page.
-    page_bytes //= _cp_degree(mcfg, attn_tp)
+    page_bytes //= _cp_degree(mcfg, attn_tp, cfg)
     # A model of linear-attention layers only has no KV: pages then only count positions.
     return cfg.num_pages or (
         int(cfg.kv_cache_gb * 2**30 // page_bytes) + 1 if page_bytes else cfg.max_num_seqs * cfg.max_pages_per_seq + 1
@@ -121,6 +124,7 @@ def set_decode_routes(cfg: EngineConfig) -> None:
     decoder.MTP_CHUNK_Q = int(cfg.mtp_chunk_q)
     decoder.DYN_MTP_KV = "1" if cfg.dyn_mtp_kv else "0"
     glm_moe_dsa.MOE_EP = int(cfg.moe_ep)
+    glm_moe_dsa.DCP = int(cfg.dcp)
 
 
 def local_k_counts(model) -> list[float] | None:
@@ -189,7 +193,7 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
         attn_group = tp.attention_group(cfg.tp, atp)
         # Context-parallel row groups (models/dsa_long.py): the cp consecutive ranks of each row group, created after
         # the attention groups on every rank (dist.new_group is collective).
-        cpd = _cp_degree(mcfg, atp)
+        cpd = _cp_degree(mcfg, atp, cfg)
         if 1 < cpd < atp:
             cp_group = tp.attention_group(cfg.tp, cpd)
     from .model_runner import fp8_e4m3_max
@@ -235,6 +239,8 @@ class LLMEngine:
             raise ValueError(
                 f"moe_ep={cfg.moe_ep}: expert parallelism is implemented for GLM-5.3 only, not {self.mcfg.architecture}"
             )
+        if cfg.dcp != 1 and self.mcfg.architecture not in glm_moe_dsa.ARCHITECTURES:
+            raise ValueError(f"dcp={cfg.dcp}: decode context parallelism is implemented for GLM-5.3 only")
         if cfg.moe_ep < 1 or cfg.tp % cfg.moe_ep:
             raise ValueError(f"moe_ep={cfg.moe_ep} must be at least 1 and divide tp={cfg.tp}")
         self.attn_tp = resolve_attention_tp(self.mcfg, cfg)

@@ -245,6 +245,13 @@ def add_engine_args(ap: argparse.ArgumentParser) -> None:
         help="expert parallelism: groups of tp / moe-ep ranks, each holding 1 / moe-ep of the routed experts (GLM-5.3 "
         "only; 1: every rank holds every expert's columns)",
     )
+    g.add_argument(
+        "--dcp",
+        type=int,
+        default=1,
+        help="decode context parallelism: each group of dcp attention ranks holds 1 / dcp of every sequence's KV cache "
+        "(GLM-5.3 only; 1: every rank holds every row)",
+    )
     g.add_argument("--num-layers", type=int, default=None, help="debugging: the first n layers only")
     sp = ap.add_argument_group(
         "speculative decoding",
@@ -430,6 +437,7 @@ def engine_config(argv: list[str], core_base: int = 0):
         tp_core_base=core_base,
         moe_kernel=a.moe_kernel,
         moe_ep=a.moe_ep,
+        dcp=a.dcp,
         num_layers=a.num_layers,
         max_running=a.max_running,
         kda_shell_max_rows=a.kda_shell_max_rows,

@@ -83,6 +83,9 @@ class EngineConfig:
     # Expert parallelism of the routed experts: groups of tp / moe_ep ranks, each holding E / moe_ep experts
     # (models/glm_moe_dsa.py MOE_EP). GLM-5.3 only; 1: every rank holds every expert's columns.
     moe_ep: int = 1
+    # Decode context parallelism: each group of dcp attention ranks holds 1 / dcp of every sequence's KV cache rows
+    # (models/glm_dcp.py). GLM-5.3 only; 1: every rank holds every row.
+    dcp: int = 1
     # Layers per piecewise graph, MoE layers included, for decode and for prefill chunks.
     piecewise_moe_group: int = 12
     piecewise_prefill_moe_group: int = 12
