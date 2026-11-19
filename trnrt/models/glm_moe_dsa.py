@@ -477,20 +477,20 @@ def _attention_dcp(model, layer, x, positions, slot_mapping, table, bias, front=
     else:  # decode
         B, Q, tab = T, 1, table
     pos = positions.reshape(-1)
-    slots = glm_dcp.local_slots(model, pos, tab.repeat_interleave(Q, dim=0), slot_mapping.reshape(-1))
+    slots = glm_dcp.local_slots(model, pos, tab, Q, slot_mapping.reshape(-1))
     model._store(layer.k_cache, slots, row.unsqueeze(1))
     if full:
         model._store(layer.v_cache, slots, ki.unsqueeze(1))
-    rows, kpos = glm_dcp.local_rows(model, tab)  # [B, Lloc], [Lloc]
-    kc = layer.k_cache[rows].squeeze(-2).to(model.dtype)  # [B, Lloc, r + dr] (model._load's cast)
-    model._dcp_lloc = rows.shape[1]
+    kc = glm_dcp.local_load(model, layer.k_cache.squeeze(1), tab)  # [B, Lloc, r + dr]
+    kpos = glm_dcp.local_pos(model, tab.shape[-1], tab.device)  # [Lloc]
+    model._dcp_lloc = kc.shape[1]
     seen = kpos.view(1, 1, -1) <= pos.view(B, Q, 1).to(torch.float32)  # [B, Q, Lloc]
     vis = glm_dcp.additive(seen)
     L = tab.shape[-1] * model.page_size
     if L > d.topk:
         if full:
             qi, wi = _indexer_query(model, layer, x, q_resid, cs, dec)
-            kI = layer.v_cache[rows].squeeze(-2).to(model.dtype).reshape(B, rows.shape[1], d.head_dim)
+            kI = glm_dcp.local_load(model, layer.v_cache.squeeze(1), tab)  # [B, Lloc, Di]
             sc = pool_index(d, (None, qi.reshape(B, Q, d.n_heads, d.head_dim)), wi.view(B, Q, d.n_heads), kI)
             sel = glm_dcp.select(model, sc, seen, kpos, d.topk)
             model._dcp_sel = sel
@@ -498,8 +498,7 @@ def _attention_dcp(model, layer, x, positions, slot_mapping, table, bias, front=
         else:
             sel = _dcp_shared(model, B, Q)
     else:  # every visible key: the local rows themselves
-        idx = torch.arange(rows.shape[1], device=rows.device).view(1, 1, -1).expand(B, Q, rows.shape[1])
-        sel = (idx, vis)
+        sel = (None, vis)
     out = glm_dcp.attend(model, layer, q_nope, q_pe, kc, sel[0], sel[1], B, Q)
     return _lin(model, layer, out, "o", dec)
 
@@ -513,20 +512,24 @@ def _dcp_share(model, sel, T: int) -> None:
     if sidx is None or T > sidx.shape[0]:
         return
     idx, mask = sel
-    m = idx.shape[-1]
-    rows = torch.arange(T, device=idx.device)
-    pad = sidx.shape[1] - m
-    vi = torch.cat([idx.reshape(T, m).to(sidx.dtype), torch.zeros(T, pad, dtype=sidx.dtype, device=idx.device)], 1)
-    vm = torch.cat([mask.reshape(T, m).to(smask.dtype), torch.full((T, pad), NEG_INF, dtype=smask.dtype,
-                                                                   device=idx.device)], 1)
-    _write_rows(sidx, rows, vi)
+    m = mask.shape[-1]
+    if m > smask.shape[1]:
+        return
+    dev = mask.device
+    rows = torch.arange(T, device=dev)
+    pad = smask.shape[1] - m
+    vm = torch.cat([mask.reshape(T, m).to(smask.dtype), torch.full((T, pad), NEG_INF, dtype=smask.dtype, device=dev)],
+                   1)
     _write_rows(smask, rows, vm)
+    if idx is not None:  # (None: every local row, in order)
+        vi = torch.cat([idx.reshape(T, m).to(sidx.dtype), torch.zeros(T, pad, dtype=sidx.dtype, device=dev)], 1)
+        _write_rows(sidx, rows, vi)
 
 
 def _dcp_shared(model, B: int, Q: int):
     """A shared layer's selection under DCP: its full layer's, from the graph's carry or the scratch."""
     sel = getattr(model, "_dcp_sel", None)
-    if sel is not None and tuple(sel[0].shape[:2]) == (B, Q):
+    if sel is not None and tuple(sel[1].shape[:2]) == (B, Q):
         return sel
     sidx, smask = getattr(model, "dcp_sel_idx", None), getattr(model, "dcp_sel_mask", None)
     if sidx is None or B * Q > sidx.shape[0]:
@@ -534,8 +537,12 @@ def _dcp_shared(model, B: int, Q: int):
                            "the selection scratch is missing or too small")
     from . import glm_dcp
 
-    m = min(glm_dcp.m_local(), model._dcp_lloc)
-    return (sidx[: B * Q, :m].long().view(B, Q, m), smask[: B * Q, :m].float().view(B, Q, m))
+    lloc = model._dcp_lloc
+    m = min(glm_dcp.m_local(model), lloc)
+    if m > smask.shape[1]:
+        raise RuntimeError(f"the DCP selection scratch holds {smask.shape[1]} candidates a row, not {m}")
+    mask = smask[: B * Q, :m].float().view(B, Q, m)
+    return (None if m == lloc else sidx[: B * Q, :m].long().view(B, Q, m)), mask
 
 
 def reference(model, layer, x, positions):
@@ -893,8 +900,8 @@ class GlmMoeDsaForCausalLM(DecoderForCausalLM):
             self.cp = cp
         dev = k_caches[0].device if k_caches else None
         rows = max(max_rows, 2)
-        self.dcp_sel_idx = torch.zeros(rows, glm_dcp.m_local(), dtype=torch.int32, device=dev)
-        self.dcp_sel_mask = torch.zeros(rows, glm_dcp.m_local(), dtype=torch.float32, device=dev)
+        self.dcp_sel_idx = torch.zeros(rows, glm_dcp.m_local(self), dtype=torch.int32, device=dev)
+        self.dcp_sel_mask = torch.zeros(rows, glm_dcp.m_local(self), dtype=torch.float32, device=dev)
 
     def group_fn(self, idxs):
         """DecoderForCausalLM.group_fn, with the selection carry cleared around each call: a graph's shared layers

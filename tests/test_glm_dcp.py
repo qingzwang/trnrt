@@ -78,3 +78,18 @@ def test_dcp_with_mtp_and_the_front_kernel_path(tmp_path, monkeypatch):
     got, eng = greedy(path, ps, 10, tp=4, dcp=4, spec_method="mtp", spec_k=2)
     assert eng.spec_verifies > 0
     assert got == want
+
+
+def test_the_mtp_board_graph_compiles_at_o1_under_dcp_only():
+    """engine/model_runner.py board_cc_args: -O1 for the MTP board graph under dcp > 1 (a neuronx-cc 2.27 failure at
+    -O2), the other graphs' arguments untouched."""
+    from trnrt.config import EngineConfig
+    from trnrt.engine.model_runner import board_cc_args
+
+    base = ["--auto-cast=none", "-O2", "--model-type=transformer"]
+    assert board_cc_args(EngineConfig(model_path="m"), base) == base
+    assert board_cc_args(EngineConfig(model_path="m", dcp=16), base) == [
+        "--auto-cast=none",
+        "-O1",
+        "--model-type=transformer",
+    ]

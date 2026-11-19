@@ -94,6 +94,16 @@ def verify_cc_args(ecfg: EngineConfig) -> list[str]:
     return [VERIFY_BIG_LIMIT] if ecfg.spec_method else []
 
 
+def board_cc_args(ecfg: EngineConfig, base: list[str]) -> list[str]:
+    """neuronx-cc arguments of the MTP board graph (mtp_prep, the draft passes and mtp_post in one graph): base, at -O1
+    under GLM-5.3's decode context parallelism. At dcp 16 neuronx-cc 2.27 failed its batch-4 graph at -O2 (NCC_ITEN406 /
+    NCC_ILSA901 on mtp_post's board scatter after fusion) and compiled it at -O1. Only this graph takes it, so no other
+    graph's compile key moves."""
+    if getattr(ecfg, "dcp", 1) > 1:
+        return ["-O1" if a == "-O2" else a for a in base]
+    return base
+
+
 def canonicalize(gm) -> None:
     """Drop keyword arguments equal to their defaults from every torch call in `gm`, so
     equivalent traces print identically (canonical_neuron_backend)."""
@@ -523,12 +533,15 @@ class ModelRunner:
                         options={"compiler_args": neuronx_cc_args(kv_dtype, fp8_weights)})
             compile_ = lambda f: torch.compile(f, **opts)  # noqa: E731
             compile_verify = None
+            bargs = board_cc_args(ecfg, neuronx_cc_args(kv_dtype, fp8_weights))
+            compile_board = (compile_ if bargs == neuronx_cc_args(kv_dtype, fp8_weights) else
+                             (lambda f: torch.compile(f, **dict(opts, options={"compiler_args": bargs}))))
             vargs = verify_cc_args(ecfg)
             if vargs:  # the whole-call verify graph's own compile function: no decode or prefill key moves
                 opts_v = dict(opts, options={"compiler_args": neuronx_cc_args(kv_dtype, fp8_weights) + vargs})
                 compile_verify = lambda f: torch.compile(f, **opts_v)  # noqa: E731
         else:
-            compile_ = lambda f: f  # noqa: E731
+            compile_ = compile_board = lambda f: f  # noqa: E731
             compile_verify = None
         # Every compiled callable counts its launches against one bound (LaunchBound); outside torch.compile, so no
         # traced graph changes. Host and meta outputs are not counted.
@@ -613,7 +626,7 @@ class ModelRunner:
                 _sa.mtp_post(b, si, draft, v, Q, k)
                 return draft, xl
 
-            self._spec_fns["mtp_board"] = compile_(mtp_board)
+            self._spec_fns["mtp_board"] = compile_board(mtp_board)
             # Decode checkpoints (the served prefix cache leaves one at every page boundary a request crosses): a blind
             # step's next verify has rewritten the state rows by the time the host reads the accepted count, so spec_ckpt
             # copies the state on the device right after spec_post.
